@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Identity Search Service Flowchart</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --surface: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --brand: #0f5e73;
+      --line: #d9e0ea;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 22px;
+      background: rgba(255, 255, 255, 0.96);
+      border-bottom: 1px solid var(--line);
+      box-shadow: 0 8px 24px rgba(15, 34, 52, 0.08);
+    }
+
+    .title {
+      font-weight: 800;
+      font-size: 17px;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    button,
+    a.button {
+      border: 1px solid #b8dfe6;
+      background: #eef7f9;
+      color: var(--brand);
+      border-radius: 8px;
+      padding: 9px 13px;
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #ffffff;
+    }
+
+    .canvas-wrap {
+      padding: 24px;
+    }
+
+    .diagram-shell {
+      width: min(100%, 1600px);
+      margin: 0 auto;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: auto;
+      box-shadow: 0 16px 42px rgba(15, 34, 52, 0.12);
+    }
+
+    img {
+      display: block;
+      width: 1600px;
+      max-width: none;
+      height: auto;
+    }
+
+    @media print {
+      body {
+        background: #ffffff;
+      }
+
+      .toolbar {
+        display: none;
+      }
+
+      .canvas-wrap {
+        padding: 0;
+      }
+
+      .diagram-shell {
+        border: 0;
+        box-shadow: none;
+        overflow: visible;
+      }
+
+      img {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div>
+      <div class="title">Identity Search Service Flowchart</div>
+      <div class="subtitle">Open this file in a browser. Use the buttons to export or print to PDF.</div>
+    </div>
+    <div class="actions">
+      <a class="button" href="Identity_Search_Service_Flowchart.svg" download>Download SVG</a>
+      <a class="button" href="Identity_Search_Service_Flowchart.mmd" download>Download Mermaid</a>
+      <button type="button" onclick="downloadPng()">Download PNG</button>
+      <button class="primary" type="button" onclick="window.print()">Print / Save PDF</button>
+    </div>
+  </div>
+
+  <main class="canvas-wrap">
+    <div class="diagram-shell">
+      <img id="diagram" src="Identity_Search_Service_Flowchart.svg" alt="Identity Search Service Flowchart">
+    </div>
+  </main>
+
+  <script>
+    function downloadPng() {
+      const image = new Image();
+      image.onload = function () {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#f4f7fb";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0);
+
+        canvas.toBlob(function (blob) {
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "Identity_Search_Service_Flowchart.png";
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          URL.revokeObjectURL(url);
+        }, "image/png");
+      };
+
+      image.onerror = function () {
+        alert("PNG export could not load the SVG. Open this HTML from the docs folder and try again.");
+      };
+
+      image.src = "Identity_Search_Service_Flowchart.svg";
+    }
+  </script>
+</body>
+</html>

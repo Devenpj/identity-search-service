@@ -1,0 +1,107 @@
+{
+    "models": {
+        "Id_Classifier": {
+            "type": "classification",
+            "path": "models/Id_Classifier.pt",
+            "classes": [
+                "aadhar_back",
+                "aadhar_front",
+                "driving_license_back",
+                "driving_license_front",
+                "pan_card_front",
+                "passport",
+                "voter_id"
+            ]
+        },
+        "Aadhaar": {
+            "type": "detection",
+            "path": "models/Aadhaar_Card.pt",
+            "classes": [
+                "Aadhaar",
+                "DOB",
+                "Gender",
+                "Name",
+                "Address"
+            ]
+        },
+        "Pan_Card": {
+            "type": "detection",
+            "path": "models/Pan_Card.pt",
+            "classes": [
+                "PAN",
+                "Name",
+                "Father's Name",
+                "DOB",
+                "Pan Card"
+            ]
+        },
+        "Passport": {
+            "type": "detection",
+            "path": "models/Passport.pt",
+            "classes": [
+                "Address",
+                "Code",
+                "DOB",
+                "DOI",
+                "EXP",
+                "Gender",
+                "MRZ2",
+                "MRZ1",
+                "MRZ2",
+                "Name",
+                "Nationality",
+                "Nation",
+                "POI"
+            ]
+        },
+        "Voter_Id": {
+            "type": "detection",
+            "path": "models/Voter_Id.pt",
+            "classes": [
+                "Address",
+                "Age",
+                "DOB",
+                "Card Voter ID 1 Back",
+                "Card Voter ID 2 Front",
+                "Card Voter ID 2 Back",
+                "Card Voter ID 1 Front",
+                "DOB",
+                "Date of Issue",
+                "Election",
+                "Father",
+                "Gender",
+                "Name",
+                "Point",
+                "Portrait",
+                "Symbol",
+                "Voter ID",
+                "Portrait",
+                "Card Voter ID 1 Back"
+            ]
+        },
+        "Driving_License": {
+            "type": "detection",
+            "path": "models/Driving_License.pt",
+            "classes": [
+                "Address",
+                "Blood Group",
+                "DL No",
+                "DOB",
+                "Name",
+                "Relation With",
+                "RTO",
+                "State",
+                "Vehicle Type"
+            ]
+        }
+    },
+    "doc_type_to_model": {
+        "aadhar_front": "Aadhaar",
+        "aadhar_back": "Aadhaar",
+        "pan_card_front": "Pan_Card",
+        "passport": "Passport",
+        "voter_id": "Voter_Id",
+        "driving_license_front": "Driving_License",
+        "driving_license_back": "Driving_License"
+    }
+}

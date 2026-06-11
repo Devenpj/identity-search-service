@@ -1,0 +1,103 @@
+graph LR
+    %% Identity Search Service - clean client-ready flowchart
+
+    User["Client / Operator"]
+
+    subgraph UI["Frontend: Streamlit Dashboard"]
+        Dashboard["Main Dashboard<br/>frontend/dashboard.py"]
+        Workflows["Dashboard Workflows<br/>Identity Search, News Intelligence,<br/>Document Validation, Face Search,<br/>Admin, Review, Register"]
+        Approval["OSINT Approval Panel<br/>User reviews targets before submission"]
+    end
+
+    subgraph API["Backend: FastAPI Layer"]
+        Entry["Backend Entry Point<br/>backend/app.py"]
+        Routes["API Routes<br/>backend/api/routes.py"]
+        Validation["Request Validation<br/>forms, files, search fields, job ids"]
+    end
+
+    subgraph Services["Backend Service Layer"]
+        DBService["Database Service<br/>SQL, searches, CRUD, news queries"]
+        DocVerify["Document Verification Service<br/>OCR + DB match + face + risk + decision"]
+        OCRService["OCR Service<br/>document field extraction"]
+        FaceService["Face Service<br/>OpenCV photo comparison"]
+        FileService["File Service<br/>upload and photo storage"]
+        RiskDecision["Risk + Decision Services<br/>score and final status"]
+        OSINTService["OSINT Service<br/>submit scan, track status, receive result"]
+    end
+
+    subgraph Data["PostgreSQL: excel_import"]
+        IdentityDB[("demodataset<br/>identity records")]
+        ReviewDB[("manual_review_cases<br/>review queue")]
+        OSINTDB[("osint_jobs<br/>job status + result JSONB")]
+        NewsDB[("news tables<br/>clusters, articles,<br/>article_entities, cluster_entities")]
+    end
+
+    subgraph Assets["Local Assets and Models"]
+        Uploads[("uploads/<br/>documents and photos")]
+        OCRModel["Indian ID Validator<br/>vendor OCR model"]
+        MatchPhotos[("matched_employee_photos<br/>face evidence")]
+    end
+
+    subgraph External["External Systems"]
+        OSINTEngine["OSINT Engine<br/>/api/v1/scan"]
+        Webhook["Webhook Callback<br/>/api/webhooks/osint-results"]
+    end
+
+    Logger["Central Logger<br/>utils/logger.py"]
+    LogOutput[("Terminal + logs/<br/>identity_search_service.log")]
+
+    User --> Dashboard
+    Dashboard --> Workflows
+    Workflows --> Approval
+    Workflows --> Entry
+    Approval --> Entry
+
+    Entry --> Routes
+    Routes --> Validation
+    Validation --> DBService
+    Validation --> DocVerify
+    Validation --> OSINTService
+
+    DocVerify --> FileService
+    DocVerify --> OCRService
+    DocVerify --> DBService
+    DocVerify --> FaceService
+    DocVerify --> RiskDecision
+
+    DBService --> IdentityDB
+    DBService --> ReviewDB
+    DBService --> OSINTDB
+    DBService --> NewsDB
+
+    FileService --> Uploads
+    OCRService --> OCRModel
+    FaceService --> MatchPhotos
+
+    OSINTService --> OSINTEngine
+    OSINTEngine --> Webhook
+    Webhook --> Routes
+    OSINTService --> OSINTDB
+
+    Routes --> Logger
+    DBService --> Logger
+    OSINTService --> Logger
+    DocVerify --> Logger
+    Logger --> LogOutput
+
+    classDef person fill:#e8f5f7,stroke:#0f5e73,stroke-width:2px,color:#172033;
+    classDef frontend fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#172033;
+    classDef backend fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#172033;
+    classDef service fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#172033;
+    classDef data fill:#ecfdf3,stroke:#087443,stroke-width:2px,color:#172033;
+    classDef asset fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#172033;
+    classDef external fill:#fff0ee,stroke:#b42318,stroke-width:2px,color:#172033;
+    classDef log fill:#fdf2f8,stroke:#be185d,stroke-width:2px,color:#172033;
+
+    class User person;
+    class Dashboard,Workflows,Approval frontend;
+    class Entry,Routes,Validation backend;
+    class DBService,DocVerify,OCRService,FaceService,FileService,RiskDecision,OSINTService service;
+    class IdentityDB,ReviewDB,OSINTDB,NewsDB data;
+    class Uploads,OCRModel,MatchPhotos asset;
+    class OSINTEngine,Webhook external;
+    class Logger,LogOutput log;
