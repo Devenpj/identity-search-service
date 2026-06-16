@@ -1,4 +1,5 @@
 .venv/
+face_engine/.venv-face/
 .env
 logs/
 *.log

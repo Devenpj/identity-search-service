@@ -5,6 +5,11 @@ from psycopg2 import errors
 import json
 import re
 
+from utils.logger import get_logger
+
+
+logger = get_logger("identity-search-service.database")
+
 
 class DatabaseService:
     """Own all direct SQL used by the FastAPI backend."""
@@ -341,8 +346,15 @@ class DatabaseService:
         )
         row = self.cursor.fetchone()
         self.connection.commit()
+        formatted_job = self._format_osint_job_row(row)
 
-        return self._format_osint_job_row(row)
+        logger.info(
+            "OSINT DB state: job_id=%s status=PENDING targets=%s",
+            formatted_job.get("job_id") if formatted_job else job_id,
+            len(targets or [])
+        )
+
+        return formatted_job
 
     def _next_osint_job_id(self):
         """Generate the next human-readable OSINT job ID like JOB00001."""
@@ -380,7 +392,19 @@ class DatabaseService:
                 job_id
             )
         )
+        updated_rows = self.cursor.rowcount
         self.connection.commit()
+
+        if updated_rows:
+            logger.info(
+                "OSINT DB state: job_id=%s status=PROCESSING provider_response_saved=True",
+                job_id
+            )
+        else:
+            logger.error(
+                "OSINT DB state update failed: job_id=%s status=PROCESSING reason=job_not_found",
+                job_id
+            )
 
     def mark_osint_job_failed(
         self,
@@ -406,7 +430,21 @@ class DatabaseService:
                 job_id
             )
         )
+        updated_rows = self.cursor.rowcount
         self.connection.commit()
+
+        if updated_rows:
+            logger.error(
+                "OSINT DB state: job_id=%s status=FAILED error=%s",
+                job_id,
+                str(error_message or "Unknown OSINT error")
+            )
+        else:
+            logger.error(
+                "OSINT DB state update failed: job_id=%s status=FAILED reason=job_not_found error=%s",
+                job_id,
+                str(error_message or "Unknown OSINT error")
+            )
 
     def complete_osint_job(
         self,
@@ -468,8 +506,72 @@ class DatabaseService:
         )
         row = self.cursor.fetchone()
         self.connection.commit()
+        formatted_job = self._format_osint_job_row(row)
 
-        return self._format_osint_job_row(row)
+        if formatted_job:
+            logger.info(
+                "OSINT DB state: job_id=%s status=%s result_saved=%s",
+                job_id,
+                formatted_job.get("status"),
+                formatted_job.get("results") is not None
+            )
+        else:
+            logger.error(
+                "OSINT DB complete failed: job_id=%s reason=job_not_found",
+                job_id
+            )
+
+        return formatted_job
+
+    def find_latest_osint_job_by_targets(
+        self,
+        target_values
+    ):
+        """Find the newest active OSINT job whose stored targets match payload values."""
+
+        normalized_values = [
+            str(value or "").strip().lower()
+            for value in target_values or []
+            if str(value or "").strip()
+        ]
+
+        if not normalized_values:
+
+            return None
+
+        query = """
+        SELECT
+            job_id,
+            status,
+            targets,
+            provider_response,
+            result,
+            error_message,
+            created_at,
+            submitted_at,
+            completed_at,
+            updated_at
+        FROM osint_jobs
+        WHERE status IN ('PENDING', 'PROCESSING')
+        AND EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(targets) AS target_item
+            WHERE LOWER(target_item ->> 'value') = ANY(%s)
+        )
+        ORDER BY
+            updated_at DESC NULLS LAST,
+            created_at DESC NULLS LAST
+        LIMIT 1
+        """
+
+        self.cursor.execute(
+            query,
+            (normalized_values,)
+        )
+
+        return self._format_osint_job_row(
+            self.cursor.fetchone()
+        )
 
     def get_osint_job(
         self,

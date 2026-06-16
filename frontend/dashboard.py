@@ -1074,7 +1074,13 @@ def formatted_table_cell(value):
         return "-"
 
     if isinstance(value, list):
-        value = len(value)
+        if not value:
+            return "-"
+
+        if all(not isinstance(item, (dict, list)) for item in value):
+            value = ", ".join(str(item) for item in value)
+        else:
+            value = json.dumps(value, ensure_ascii=False)
 
     if isinstance(value, dict):
         value = json.dumps(value, ensure_ascii=False)
@@ -1087,6 +1093,9 @@ def formatted_table_cell(value):
             f'<a class="table-link" href="{escaped_value}" '
             f'target="_blank" rel="noopener noreferrer">{escaped_value}</a>'
         )
+
+    if "\n" in value:
+        return escaped_value.replace("\n", "<br>")
 
     return escaped_value
 
@@ -1280,8 +1289,10 @@ def resolve_photo_path(photo_path):
     if not photo_path:
         return None
 
-    if os.path.isabs(photo_path) and os.path.exists(photo_path):
-        return photo_path
+    normalized_path = os.path.normpath(str(photo_path))
+
+    if os.path.isabs(normalized_path) and os.path.exists(normalized_path):
+        return normalized_path
 
     project_root = os.path.abspath(
         os.path.join(
@@ -1289,10 +1300,15 @@ def resolve_photo_path(photo_path):
             ".."
         )
     )
-    relative_path = photo_path.lstrip("/\\")
+    relative_path = normalized_path.lstrip("/\\")
+    file_name = os.path.basename(relative_path)
     candidates = [
         os.path.join(project_root, relative_path),
         os.path.join(project_root, "frontend", relative_path),
+        os.path.join(project_root, "backend", relative_path),
+        os.path.join(project_root, "backend", "uploads", file_name),
+        os.path.join(project_root, "uploads", file_name),
+        os.path.join(project_root, "frontend", "matched_employee_photos", file_name),
         os.path.abspath(relative_path)
     ]
 
@@ -1300,7 +1316,7 @@ def resolve_photo_path(photo_path):
         if os.path.exists(candidate):
             return candidate
 
-    return candidates[1]
+    return None
 
 
 def safe_json_response(response):
@@ -1315,7 +1331,7 @@ def safe_json_response(response):
         }
 
 
-def post_request(url, data=None, files=None):
+def post_request(url, data=None, files=None, timeout=180):
     """POST to the backend and normalize connection/JSON errors."""
 
     try:
@@ -1323,7 +1339,7 @@ def post_request(url, data=None, files=None):
             url,
             data=data,
             files=files,
-            timeout=180
+            timeout=timeout
         )
         return response, safe_json_response(response)
     except requests.RequestException as error:
@@ -1395,15 +1411,19 @@ def render_face_evidence(left_label, left_path, right_label, right_path):
 
     with left:
         st.markdown(f'<div class="evidence-label">{left_label}</div>', unsafe_allow_html=True)
-        if left_path and os.path.exists(left_path):
-            st.image(left_path, width=210)
+        resolved_left_path = resolve_photo_path(left_path)
+
+        if resolved_left_path:
+            st.image(resolved_left_path, width=210)
         else:
             st.warning("Image not available")
 
     with right:
         st.markdown(f'<div class="evidence-label">{right_label}</div>', unsafe_allow_html=True)
-        if right_path and os.path.exists(right_path):
-            st.image(right_path, width=210)
+        resolved_right_path = resolve_photo_path(right_path)
+
+        if resolved_right_path:
+            st.image(resolved_right_path, width=210)
         else:
             st.warning("Image not available")
 
@@ -1666,18 +1686,334 @@ def apply_admin_create_ocr_prefill(extracted_data):
     return changed_fields
 
 
+def flatten_osint_match_results(result_rows):
+    """Flatten OSINT result rows that contain nested `matches` arrays."""
+
+    flattened_rows = []
+
+    for result_row in result_rows or []:
+        matches = result_row.get("matches") or []
+
+        if not matches:
+            flattened_rows.append(
+                {
+                    "target": result_row.get("target"),
+                    "input_type": result_row.get("input_type"),
+                    "result_status": result_row.get("status"),
+                    "platform": "-",
+                    "match_status": result_row.get("message") or "-",
+                    "category": "-",
+                    "details": result_row.get("message") or "-"
+                }
+            )
+            continue
+
+        for match in matches:
+            flattened_rows.append(
+                {
+                    "target": result_row.get("target"),
+                    "input_type": result_row.get("input_type"),
+                    "result_status": result_row.get("status"),
+                    "platform": match.get("platform"),
+                    "match_status": match.get("status") or result_row.get("status"),
+                    "category": match.get("category"),
+                    "details": match.get("details") or match.get("message")
+                }
+            )
+
+    return flattened_rows
+
+
+def humanize_payload_key(key):
+    """Convert provider payload keys into readable dashboard labels."""
+
+    return str(key or "").replace("_", " ").strip().title()
+
+
+def collect_osint_urls(value, source="Result"):
+    """Recursively collect URL-like fields from arbitrary OSINT payloads."""
+
+    collected_urls = []
+
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            nested_source = f"{source} / {humanize_payload_key(key)}"
+
+            if (
+                isinstance(nested_value, str)
+                and nested_value.startswith(("http://", "https://"))
+            ):
+                collected_urls.append(
+                    {
+                        "source": nested_source,
+                        "url": nested_value
+                    }
+                )
+
+            collected_urls.extend(
+                collect_osint_urls(
+                    nested_value,
+                    nested_source
+                )
+            )
+
+    elif isinstance(value, list):
+        for index, nested_value in enumerate(value, 1):
+            collected_urls.extend(
+                collect_osint_urls(
+                    nested_value,
+                    f"{source} #{index}"
+                )
+            )
+
+    return collected_urls
+
+
+def flatten_payload_for_display(value, prefix=""):
+    """Flatten arbitrary OSINT payloads into key/value rows for detailed display."""
+
+    rows = []
+
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            next_prefix = (
+                f"{prefix}.{key}"
+                if prefix
+                else str(key)
+            )
+            rows.extend(
+                flatten_payload_for_display(
+                    nested_value,
+                    next_prefix
+                )
+            )
+
+        return rows
+
+    if isinstance(value, list):
+        if not value:
+            rows.append(
+                {
+                    "field": prefix or "items",
+                    "value": "-"
+                }
+            )
+            return rows
+
+        for index, nested_value in enumerate(value, 1):
+            rows.extend(
+                flatten_payload_for_display(
+                    nested_value,
+                    f"{prefix}[{index}]"
+                )
+            )
+
+        return rows
+
+    rows.append(
+        {
+            "field": prefix or "value",
+            "value": value
+        }
+    )
+
+    return rows
+
+
+def dynamic_osint_columns(rows):
+    """Build readable table columns from arbitrary OSINT dictionaries."""
+
+    priority_keys = [
+        "target",
+        "target_username",
+        "input_type",
+        "platform",
+        "status",
+        "profile_url",
+        "url",
+        "name",
+        "username",
+        "message",
+        "details"
+    ]
+    discovered_keys = []
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        for key in row.keys():
+            if key not in discovered_keys:
+                discovered_keys.append(key)
+
+    ordered_keys = [
+        key
+        for key in priority_keys
+        if key in discovered_keys
+    ]
+    ordered_keys.extend(
+        key
+        for key in discovered_keys
+        if key not in ordered_keys
+    )
+
+    return [
+        (
+            humanize_payload_key(key),
+            key
+        )
+        for key in ordered_keys[:10]
+    ]
+
+
+def render_generic_osint_section(section_key, section_value):
+    """Render unknown OSINT provider sections such as Facebook automatically."""
+
+    title = humanize_payload_key(section_key)
+    st.markdown(f"**{title}**")
+
+    if isinstance(section_value, list):
+        if all(isinstance(item, dict) for item in section_value):
+            render_light_table(
+                section_value,
+                dynamic_osint_columns(section_value),
+                f"No {title.lower()} were returned."
+            )
+            with st.expander(f"{title} Detailed Fields"):
+                render_light_table(
+                    flatten_payload_for_display(section_value, section_key),
+                    [
+                        ("Field", "field"),
+                        ("Value", "value")
+                    ],
+                    f"No {title.lower()} details were returned."
+                )
+        else:
+            render_light_table(
+                [
+                    {
+                        "value": item
+                    }
+                    for item in section_value
+                ],
+                [
+                    ("Value", "value")
+                ],
+                f"No {title.lower()} were returned."
+            )
+        return
+
+    if isinstance(section_value, dict):
+        render_light_table(
+            [section_value],
+            dynamic_osint_columns([section_value]),
+            f"No {title.lower()} details were returned."
+        )
+        with st.expander(f"{title} Detailed Fields"):
+            render_light_table(
+                flatten_payload_for_display(section_value, section_key),
+                [
+                    ("Field", "field"),
+                    ("Value", "value")
+                ],
+                f"No {title.lower()} details were returned."
+            )
+        return
+
+    render_light_table(
+        [
+            {
+                "field": title,
+                "value": section_value
+            }
+        ],
+        [
+            ("Field", "field"),
+            ("Value", "value")
+        ],
+        f"No {title.lower()} value was returned."
+    )
+
+
 def render_osint_results(results):
     """Render OSINT provider results as dashboard tables instead of raw JSON."""
 
     results = results or {}
+    known_result_keys = {
+        "inputs_processed",
+        "username_results",
+        "instagram_results",
+        "phone_results",
+        "email_results",
+        "all_matches",
+        "profile_url"
+    }
+    inputs_processed = results.get("inputs_processed") or []
     username_results = results.get("username_results") or []
     instagram_results = results.get("instagram_results") or []
+    phone_results = results.get("phone_results") or []
+    email_results = results.get("email_results") or []
     all_matches = results.get("all_matches") or []
+    extra_sections = {
+        key: value
+        for key, value in results.items()
+        if key not in known_result_keys
+        and value not in (None, "", [], {})
+    }
 
-    metric_one, metric_two, metric_three = st.columns(3)
+    for instagram_result in instagram_results:
+        extracted_data = instagram_result.setdefault(
+            "extracted_data",
+            {}
+        )
+        if instagram_result.get("profile_url") and not extracted_data.get("profile_url"):
+            extracted_data["profile_url"] = instagram_result.get("profile_url")
+
+    metric_one, metric_two, metric_three, metric_four, metric_five = st.columns(5)
     metric_one.metric("Username Results", len(username_results))
     metric_two.metric("Instagram Results", len(instagram_results))
-    metric_three.metric("All Matches", len(all_matches))
+    metric_three.metric("Phone Results", len(phone_results))
+    metric_four.metric("Email Results", len(email_results))
+    metric_five.metric("Other Sections", len(extra_sections))
+
+    profile_links = collect_osint_urls(results, "OSINT Payload")
+    unique_profile_links = []
+    seen_urls = set()
+
+    for link in profile_links:
+        url = link.get("url")
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        unique_profile_links.append(link)
+
+    if unique_profile_links:
+        st.markdown("**Profile And Source URLs**")
+        render_light_table(
+            unique_profile_links,
+            [
+                ("Source", "source"),
+                ("URL", "url")
+            ],
+            "No profile URLs were returned."
+        )
+
+    if inputs_processed:
+        st.markdown("**Inputs Processed**")
+        render_light_table(
+            [
+                {
+                    "input": input_value
+                }
+                for input_value in inputs_processed
+            ],
+            [
+                ("Input", "input")
+            ],
+            "No processed inputs were returned."
+        )
 
     st.markdown("**Username Results**")
     render_light_table(
@@ -1698,11 +2034,40 @@ def render_osint_results(results):
             ("Target", "target_username"),
             ("Platform", "platform"),
             ("Status", "status"),
+            ("Profile URL", "extracted_data.profile_url"),
             ("Bio", "extracted_data.bio"),
             ("Avatar URL", "extracted_data.avatar_url"),
             ("Top Posts", "extracted_data.top_posts")
         ],
         "No Instagram results were returned."
+    )
+
+    st.markdown("**Phone Results**")
+    render_light_table(
+        flatten_osint_match_results(phone_results),
+        [
+            ("Target", "target"),
+            ("Input Type", "input_type"),
+            ("Result Status", "result_status"),
+            ("Platform", "platform"),
+            ("Details", "details")
+        ],
+        "No phone results were returned."
+    )
+
+    st.markdown("**Email Results**")
+    render_light_table(
+        flatten_osint_match_results(email_results),
+        [
+            ("Target", "target"),
+            ("Input Type", "input_type"),
+            ("Result Status", "result_status"),
+            ("Platform", "platform"),
+            ("Match Status", "match_status"),
+            ("Category", "category"),
+            ("Details", "details")
+        ],
+        "No email results were returned."
     )
 
     st.markdown("**Enriched Matches**")
@@ -1717,6 +2082,22 @@ def render_osint_results(results):
         ],
         "No enriched matches were returned."
     )
+
+    for section_key, section_value in extra_sections.items():
+        render_generic_osint_section(
+            section_key,
+            section_value
+        )
+
+    with st.expander("Complete OSINT Payload Details"):
+        render_light_table(
+            flatten_payload_for_display(results, "osint"),
+            [
+                ("Field", "field"),
+                ("Value", "value")
+            ],
+            "No OSINT payload details were returned."
+        )
 
 
 OSINT_TERMINAL_STATUSES = {"COMPLETED", "FAILED"}
@@ -2062,6 +2443,7 @@ def format_news_date(value):
         return "-"
 
     value = str(value)
+
 
     return value.replace("T", " ").split("+")[0][:19]
 
@@ -2760,11 +3142,26 @@ if selected_dashboard_section == "Face Search":
         if uploaded_face_image is None:
             status_panel("Please upload a face image.", "danger")
         else:
-            with st.spinner("Comparing uploaded face with database photos..."):
+            face_progress = st.progress(
+                10,
+                text="Preparing uploaded face image..."
+            )
+            face_progress.progress(
+                35,
+                text="Searching database face records..."
+            )
+
+            with st.spinner("Matching face. Please wait..."):
                 response, result = post_request(
                     FACE_SEARCH_URL,
-                    files=uploaded_file_payload("image", uploaded_face_image)
+                    files=uploaded_file_payload("image", uploaded_face_image),
+                    timeout=900
                 )
+
+            face_progress.progress(
+                100,
+                text="Face search completed."
+            )
 
             if response is None or response.status_code != 200:
                 status_panel(result.get("message", "Face search failed."), "danger")
@@ -2783,10 +3180,6 @@ if selected_dashboard_section == "Face Search":
                     "Best Database Candidate",
                     face_verification.get("database_face_path")
                 )
-
-                score = face_verification.get("score")
-                if score is not None:
-                    st.caption(f"Best score: {score}")
 
                 if face_verification.get("error"):
                     st.caption(face_verification.get("error"))

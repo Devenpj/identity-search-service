@@ -10,6 +10,7 @@ import hmac
 import json
 import re
 
+import requests
 from fastapi import BackgroundTasks
 from fastapi import FastAPI
 from fastapi import Form
@@ -64,6 +65,77 @@ document_verification_service = DocumentVerificationService(
     risk_service,
     decision_service
 )
+
+
+def database_health_payload():
+    """Check PostgreSQL connectivity without exposing credentials."""
+
+    health_database_service = None
+
+    try:
+        health_database_service = DatabaseService()
+        health_database_service.cursor.execute("SELECT 1")
+        health_database_service.cursor.fetchone()
+
+        return {
+            "status": "ok",
+            "database": "excel_import",
+            "message": "PostgreSQL connection is healthy"
+        }, 200
+
+    except Exception as error:
+        logger.exception("Database health check failed")
+
+        return {
+            "status": "error",
+            "database": "excel_import",
+            "message": str(error)
+        }, 503
+
+    finally:
+        if health_database_service:
+            health_database_service.close()
+
+
+def osint_health_payload(check_network=False):
+    """Check OSINT configuration and optionally verify network reachability."""
+
+    configured = osint_service.is_configured()
+    payload = {
+        "status": "ok" if configured else "error",
+        "configured": configured,
+        "api_base_url": settings.OSINT_API_BASE_URL or None,
+        "scan_path": settings.OSINT_SCAN_PATH,
+        "callback_configured": bool(settings.OSINT_CALLBACK_URL),
+        "message": "OSINT configuration is present"
+        if configured
+        else osint_service.configuration_message()
+    }
+    status_code = 200 if configured else 503
+
+    if not configured or not check_network:
+        return payload, status_code
+
+    try:
+        response = requests.get(
+            settings.OSINT_API_BASE_URL,
+            timeout=3
+        )
+        payload["network"] = {
+            "reachable": True,
+            "http_status": response.status_code
+        }
+
+    except Exception as error:
+        logger.exception("OSINT network health check failed")
+        payload["status"] = "error"
+        payload["network"] = {
+            "reachable": False,
+            "error": str(error)
+        }
+        status_code = 503
+
+    return payload, status_code
 
 """Helper functions for validating and normalizing identity search criteria and OSINT targets."""
 
@@ -191,12 +263,68 @@ def normalize_osint_items(items):
     return targets[:10]
 
 
+def extract_osint_webhook_target_values(payload):
+    """Collect searchable target values from provider webhook payloads without job_id."""
+
+    values = []
+
+    def add_value(value):
+        normalized_value = str(value or "").strip()
+
+        if normalized_value and normalized_value.lower() not in [
+            item.lower()
+            for item in values
+        ]:
+
+            values.append(normalized_value)
+
+        digits_only = re.sub(
+            r"\D",
+            "",
+            normalized_value
+        )
+
+        if len(digits_only) > 10 and digits_only.startswith("91"):
+
+            add_value(digits_only[-10:])
+
+        if normalized_value.startswith("@"):
+
+            add_value(normalized_value[1:])
+
+    for value in payload.get("inputs_processed") or []:
+
+        add_value(value)
+
+    for result_key in (
+        "email_results",
+        "phone_results",
+        "username_results"
+    ):
+
+        for result_item in payload.get(result_key) or []:
+
+            add_value(result_item.get("target"))
+
+    for instagram_item in payload.get("instagram_results") or []:
+
+        add_value(instagram_item.get("target"))
+        add_value(instagram_item.get("target_username"))
+
+    return values
+
+
 def submit_osint_job_background(
     job_id,
     targets
 ):
     """Submit an OSINT job using a fresh DB connection for the background task."""
 
+    logger.info(
+        "OSINT background task started: job_id=%s total_targets=%s",
+        job_id,
+        len(targets or [])
+    )
     background_database_service = DatabaseService()
 
     try:
@@ -210,6 +338,10 @@ def submit_osint_job_background(
     finally:
 
         background_database_service.close()
+        logger.info(
+            "OSINT background task finished: job_id=%s",
+            job_id
+        )
 
 
 @app.get("/")
@@ -219,6 +351,76 @@ def home():
     return {
         "message": "Identity Search API Running"
     }
+
+
+@app.get("/health")
+def health():
+    """Return a lightweight API-only health response."""
+
+    return {
+        "status": "ok",
+        "service": "identity-search-service",
+        "message": "Backend API is running"
+    }
+
+
+@app.get("/health/db")
+def health_db():
+    """Return PostgreSQL connectivity health."""
+
+    payload, status_code = database_health_payload()
+
+    return JSONResponse(
+        status_code=status_code,
+        content=payload
+    )
+
+
+@app.get("/health/osint")
+def health_osint(
+
+    check_network: bool = Query(False)
+
+):
+    """Return OSINT config health and optional network reachability."""
+
+    payload, status_code = osint_health_payload(check_network)
+
+    return JSONResponse(
+        status_code=status_code,
+        content=payload
+    )
+
+
+@app.get("/health/full")
+def health_full(
+
+    check_osint_network: bool = Query(False)
+
+):
+    """Return API, DB, and OSINT health in one response."""
+
+    db_payload, db_status_code = database_health_payload()
+    osint_payload, osint_status_code = osint_health_payload(
+        check_network=check_osint_network
+    )
+    status_code = 200
+
+    if db_status_code >= 400 or osint_status_code >= 400:
+        status_code = 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ok" if status_code == 200 else "error",
+            "service": "identity-search-service",
+            "api": {
+                "status": "ok"
+            },
+            "database": db_payload,
+            "osint": osint_payload
+        }
+    )
 
 
 """Starting of the search-identity route which accepts one field and value to search in the database."""
@@ -340,14 +542,27 @@ async def search_identity_advanced(
 
         if should_submit_osint and osint_targets and osint_service.is_configured():
 
+            logger.info(
+                "OSINT job creation requested from advanced search: total_targets=%s",
+                len(osint_targets)
+            )
             osint_job = database_service.create_osint_job(
                 targets=osint_targets
             )
             job_id = osint_job.get("job_id")
+            logger.info(
+                "OSINT job created from advanced search: job_id=%s db_status=%s",
+                job_id,
+                osint_job.get("status")
+            )
             background_tasks.add_task(
                 submit_osint_job_background,
                 job_id,
                 osint_targets
+            )
+            logger.info(
+                "OSINT job scheduled for engine submission: job_id=%s",
+                job_id
             )
 
         logger.info(
@@ -428,15 +643,28 @@ async def submit_approved_osint_job(
             raise ValueError("OSINT targets must be a list")
 
         osint_targets = normalize_osint_items(items)
+        logger.info(
+            "Approved OSINT job creation requested: total_targets=%s",
+            len(osint_targets)
+        )
         osint_job = database_service.create_osint_job(
             targets=osint_targets
         )
         job_id = osint_job.get("job_id")
+        logger.info(
+            "Approved OSINT job created: job_id=%s db_status=%s",
+            job_id,
+            osint_job.get("status")
+        )
 
         background_tasks.add_task(
             submit_osint_job_background,
             job_id,
             osint_targets
+        )
+        logger.info(
+            "Approved OSINT job scheduled for engine submission: job_id=%s",
+            job_id
         )
 
         logger.info(
@@ -710,16 +938,46 @@ async def receive_osint_results(
             payload.get("job_id")
             or ""
         ).strip()
+        logger.info(
+            "OSINT webhook received: job_id=%s status=%s payload_keys=%s",
+            job_id or "-",
+            payload.get("status"),
+            list(payload.keys())
+        )
 
         if not job_id:
 
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "message": "Webhook payload must include job_id"
-                }
+            target_values = extract_osint_webhook_target_values(payload)
+            matched_job = request_database_service.find_latest_osint_job_by_targets(
+                target_values
             )
+
+            if matched_job:
+
+                job_id = matched_job.get("job_id")
+                logger.info(
+                    "OSINT webhook matched without job_id: job_id=%s matched_targets=%s",
+                    job_id,
+                    target_values
+                )
+
+            else:
+
+                logger.error(
+                    "OSINT webhook missing job_id and no active job matched: target_values=%s",
+                    target_values
+                )
+
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": (
+                            "Webhook payload must include job_id or match an active "
+                            "OSINT job target"
+                        )
+                    }
+                )
 
         completed_job = request_database_service.complete_osint_job(
             job_id=job_id,
@@ -741,8 +999,10 @@ async def receive_osint_results(
             )
 
         logger.info(
-            "OSINT webhook stored: job_id=%s",
-            completed_job.get("job_id")
+            "OSINT webhook stored: job_id=%s db_status=%s result_saved=%s",
+            completed_job.get("job_id"),
+            completed_job.get("status"),
+            completed_job.get("results") is not None
         )
 
         return JSONResponse(
@@ -1477,7 +1737,9 @@ async def search_by_face(
 
                 "database_match": face_search_result.get("best_match"),
 
-                "face_verification": face_search_result.get("face_verification")
+                "face_verification": face_search_result.get("face_verification"),
+
+                "top_candidates": face_search_result.get("top_candidates", [])
             }
         )
 
