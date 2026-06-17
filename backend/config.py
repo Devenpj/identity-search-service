@@ -81,6 +81,40 @@ class Settings:
             "20"
         )
     )
+    FACE_MATCH_THRESHOLD = float(
+        os.environ.get(
+            "FACE_MATCH_THRESHOLD",
+            "0.72"
+        )
+    )
+    FACE_MIN_SCORE_GAP = float(
+        os.environ.get(
+            "FACE_MIN_SCORE_GAP",
+            "0.08"
+        )
+    )
+    FACE_STRONG_MATCH_THRESHOLD = float(
+        os.environ.get(
+            "FACE_STRONG_MATCH_THRESHOLD",
+            "0.74"
+        )
+    )
+    FACE_ENGINE_URL = os.environ.get(
+        "FACE_ENGINE_URL",
+        ""
+    )
+    FACE_ENGINE_TIMEOUT_SECONDS = float(
+        os.environ.get(
+            "FACE_ENGINE_TIMEOUT_SECONDS",
+            "300"
+        )
+    )
+    FACE_ENGINE_BATCH_SIZE = int(
+        os.environ.get(
+            "FACE_ENGINE_BATCH_SIZE",
+            "100"
+        )
+    )
 
 
 settings = Settings()
