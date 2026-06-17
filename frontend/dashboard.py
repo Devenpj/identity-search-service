@@ -2426,7 +2426,7 @@ def render_osint_approval_panel():
             status_panel(result.get("message", "OSINT job could not be queued."), "danger")
             return
 
-        osint_job = result.get("osint_job") or {}
+        osint_job = result.get("osint_job") or result.get("job") or {}
 
         if osint_job.get("job_id"):
             st.session_state["active_osint_job_id"] = osint_job.get("job_id")
@@ -2434,6 +2434,53 @@ def render_osint_approval_panel():
             st.session_state.pop("pending_osint_items", None)
             status_panel("OSINT job approved and queued.", "success")
             st.rerun()
+
+
+def render_osint_job_lookup_panel():
+    """Let operators load any existing OSINT job by ID for review/testing."""
+
+    st.markdown('<div class="section-title">Load OSINT Job</div>', unsafe_allow_html=True)
+    lookup_col, action_col = st.columns([3, 1], gap="medium")
+
+    with lookup_col:
+        lookup_job_id = st.text_input(
+            "OSINT Job ID",
+            value=st.session_state.get("osint_lookup_job_id", "JOBDUMMY01"),
+            key="osint_lookup_job_id",
+            placeholder="Example: JOBDUMMY01"
+        )
+
+    with action_col:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        load_job_clicked = st.button(
+            "Load Job",
+            use_container_width=True
+        )
+
+    if load_job_clicked:
+        normalized_job_id = str(lookup_job_id or "").strip()
+
+        if not normalized_job_id:
+            status_panel("Enter an OSINT job ID to load.", "danger")
+            return
+
+        response, result = get_request(
+            f"{OSINT_JOBS_URL}/{normalized_job_id}"
+        )
+
+        if response is None or response.status_code != 200:
+            status_panel(result.get("message", "OSINT job could not be loaded."), "danger")
+            return
+
+        osint_job = result.get("osint_job") or result.get("job") or {}
+
+        if not osint_job:
+            status_panel("OSINT job response did not include job details.", "danger")
+            return
+
+        st.session_state["last_osint_job"] = osint_job
+        st.session_state.pop("active_osint_job_id", None)
+        status_panel(f"Loaded OSINT job {normalized_job_id}.", "success")
 
 
 def format_news_date(value):
@@ -2851,6 +2898,7 @@ if selected_dashboard_section == "Identity Search":
         render_identity_search_results(st.session_state.get("identity_search_result"))
 
     render_osint_approval_panel()
+    render_osint_job_lookup_panel()
 
     if st.session_state.get("active_osint_job_id"):
         render_osint_job_status(st.session_state.get("active_osint_job_id"))

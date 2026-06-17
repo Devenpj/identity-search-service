@@ -18,7 +18,7 @@ from fastapi import Header
 from fastapi import UploadFile
 from fastapi import File
 from fastapi import Query
-from fastapi import Request
+from fastapi import Body
 from fastapi.responses import JSONResponse
 
 try:
@@ -904,7 +904,23 @@ async def get_news_cluster_detail(
 @app.post("/api/webhooks/osint-results")
 async def receive_osint_results(
 
-    request: Request,
+    payload: dict = Body(
+        ...,
+        example={
+            "job_id": "JOBDUMMY01",
+            "status": "completed",
+            "results": {
+                "profile_url": "https://www.instagram.com/ad018jan/",
+                "facebook_results": [
+                    {
+                        "platform": "Facebook",
+                        "profile_url": "https://www.facebook.com/ad018jan",
+                        "status": "found"
+                    }
+                ]
+            }
+        }
+    ),
 
     webhook_token: str = Query(""),
 
@@ -933,7 +949,6 @@ async def receive_osint_results(
                 }
             )
 
-        payload = await request.json()
         job_id = str(
             payload.get("job_id")
             or ""
