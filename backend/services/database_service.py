@@ -4,6 +4,7 @@ import psycopg2
 from psycopg2 import errors
 import json
 import re
+import threading
 
 from utils.logger import get_logger
 
@@ -13,6 +14,9 @@ logger = get_logger("identity-search-service.database")
 
 class DatabaseService:
     """Own all direct SQL used by the FastAPI backend."""
+
+    _schema_ready = False
+    _schema_lock = threading.Lock()
 
     def __init__(self):
         """Open the `excel_import` database and ensure required helper tables."""
@@ -26,10 +30,29 @@ class DatabaseService:
         )
 
         self.cursor = self.connection.cursor()
-        self._ensure_document_columns()
-        self._ensure_manual_review_table()
-        self._ensure_osint_jobs_table()
+        self._ensure_runtime_schema()
         self.extended_document_columns = self._get_existing_extended_columns()
+
+    def _ensure_runtime_schema(self):
+        """Run one-time schema setup lazily instead of on every DB connection."""
+
+        if DatabaseService._schema_ready:
+
+            return
+
+        with DatabaseService._schema_lock:
+
+            if DatabaseService._schema_ready:
+
+                return
+
+            self._ensure_document_columns()
+            self._ensure_manual_review_table()
+            self._ensure_osint_jobs_table()
+            self._ensure_face_search_jobs_table()
+            self._ensure_document_validation_jobs_table()
+            self._ensure_osint_normalized_tables()
+            DatabaseService._schema_ready = True
 
     def _ensure_manual_review_table(self):
         """Create the manual review queue table used by reviewer workflows."""
@@ -138,6 +161,200 @@ class DatabaseService:
         self.cursor.execute(query)
         self.connection.commit()
 
+    def _ensure_face_search_jobs_table(self):
+        """Create the persisted face-search job table used for async polling."""
+
+        query = """
+        CREATE SEQUENCE IF NOT EXISTS face_search_job_number_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS face_search_jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            uploaded_image_path TEXT NOT NULL,
+            total_candidates INTEGER,
+            progress_percent INTEGER NOT NULL DEFAULT 5,
+            progress_message TEXT,
+            result JSONB,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS total_candidates INTEGER;
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS progress_percent INTEGER NOT NULL DEFAULT 5;
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS progress_message TEXT;
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS result JSONB;
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;
+
+        ALTER TABLE face_search_jobs
+        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
+
+        CREATE INDEX IF NOT EXISTS idx_face_search_jobs_status
+        ON face_search_jobs(status);
+        """
+
+        self.cursor.execute(query)
+        self.connection.commit()
+
+    def _ensure_document_validation_jobs_table(self):
+        """Create the persisted document-validation job table for async polling."""
+
+        query = """
+        CREATE SEQUENCE IF NOT EXISTS document_validation_job_number_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS document_validation_jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            document_type TEXT NOT NULL,
+            uploaded_document_path TEXT NOT NULL,
+            original_filename TEXT,
+            manual_values JSONB NOT NULL DEFAULT '{}'::jsonb,
+            progress_percent INTEGER NOT NULL DEFAULT 5,
+            progress_message TEXT,
+            result JSONB,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS original_filename TEXT;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS manual_values JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS progress_percent INTEGER NOT NULL DEFAULT 5;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS progress_message TEXT;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS result JSONB;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;
+
+        ALTER TABLE document_validation_jobs
+        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
+
+        CREATE INDEX IF NOT EXISTS idx_document_validation_jobs_status
+        ON document_validation_jobs(status);
+        """
+
+        self.cursor.execute(query)
+        self.connection.commit()
+
+    def _ensure_osint_normalized_tables(self):
+        """Create searchable OSINT tables derived from raw provider payloads."""
+
+        query = """
+        CREATE TABLE IF NOT EXISTS osint_profiles (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES osint_jobs(job_id) ON DELETE CASCADE,
+            employee_id TEXT,
+            platform TEXT,
+            target TEXT,
+            username TEXT,
+            full_name TEXT,
+            profile_url TEXT,
+            avatar_url TEXT,
+            avatar_path TEXT,
+            bio TEXT,
+            status TEXT,
+            confidence TEXT,
+            extracted_text TEXT,
+            raw_payload JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_osint_profiles_job_id
+        ON osint_profiles(job_id);
+
+        CREATE INDEX IF NOT EXISTS idx_osint_profiles_employee_id
+        ON osint_profiles(employee_id);
+
+        CREATE INDEX IF NOT EXISTS idx_osint_profiles_platform
+        ON osint_profiles(platform);
+
+        CREATE TABLE IF NOT EXISTS osint_contacts (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES osint_jobs(job_id) ON DELETE CASCADE,
+            employee_id TEXT,
+            contact_type TEXT,
+            target TEXT,
+            platform TEXT,
+            status TEXT,
+            category TEXT,
+            details TEXT,
+            raw_payload JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_osint_contacts_job_id
+        ON osint_contacts(job_id);
+
+        CREATE INDEX IF NOT EXISTS idx_osint_contacts_target
+        ON osint_contacts(target);
+
+        CREATE TABLE IF NOT EXISTS osint_matches (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES osint_jobs(job_id) ON DELETE CASCADE,
+            employee_id TEXT,
+            platform TEXT,
+            url TEXT,
+            bio TEXT,
+            avatar_url TEXT,
+            avatar_path TEXT,
+            confidence TEXT,
+            raw_payload JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_osint_matches_job_id
+        ON osint_matches(job_id);
+
+        CREATE TABLE IF NOT EXISTS osint_identity_links (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES osint_jobs(job_id) ON DELETE CASCADE,
+            employee_id TEXT,
+            link_reason TEXT,
+            match_score NUMERIC,
+            face_match_status TEXT,
+            face_score NUMERIC,
+            decision TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_osint_identity_links_job_id
+        ON osint_identity_links(job_id);
+
+        CREATE INDEX IF NOT EXISTS idx_osint_identity_links_employee_id
+        ON osint_identity_links(employee_id);
+        """
+
+        self.cursor.execute(query)
+        self.connection.commit()
+
     def _get_existing_extended_columns(self):
         """Detect optional document columns so old databases still work."""
 
@@ -237,7 +454,7 @@ class DatabaseService:
         self,
         criteria
     ):
-        """Search `demodataset` using multiple OR-connected criteria."""
+        """Search `demodataset` using all provided criteria together."""
 
         conditions = []
         parameters = []
@@ -279,7 +496,7 @@ class DatabaseService:
             state,
             photo_path
         FROM demodataset
-        WHERE {" OR ".join(conditions)}
+        WHERE {" AND ".join(f"({condition})" for condition in conditions)}
         LIMIT 50
         """
 
@@ -306,6 +523,659 @@ class DatabaseService:
     # OSINT JOBS
     # -----------------------------------
 
+    def _next_face_search_job_id(self):
+        """Generate the next readable async face-search job ID like FACE00001."""
+
+        self.cursor.execute(
+            """
+            SELECT 'FACE' || LPAD(nextval('face_search_job_number_seq')::TEXT, 5, '0')
+            """
+        )
+
+        return self.cursor.fetchone()[0]
+
+    def create_face_search_job(
+        self,
+        uploaded_image_path
+    ):
+        """Insert a pending face-search job and return the stored job payload."""
+
+        job_id = self._next_face_search_job_id()
+        query = """
+        INSERT INTO face_search_jobs (
+            job_id,
+            status,
+            uploaded_image_path,
+            progress_percent,
+            progress_message
+        )
+        VALUES (%s, 'PENDING', %s, 10, 'Face image uploaded. Waiting to start search.')
+        RETURNING
+            job_id,
+            status,
+            uploaded_image_path,
+            total_candidates,
+            progress_percent,
+            progress_message,
+            result,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                job_id,
+                uploaded_image_path
+            )
+        )
+        row = self.cursor.fetchone()
+        self.connection.commit()
+        formatted_job = self._format_face_search_job_row(row)
+
+        logger.info(
+            "Face search DB state: job_id=%s status=PENDING uploaded_image_path=%s",
+            job_id,
+            uploaded_image_path
+        )
+
+        return formatted_job
+
+    def mark_face_search_job_processing(
+        self,
+        job_id,
+        total_candidates
+    ):
+        """Move a face-search job into processing after candidates are loaded."""
+
+        query = """
+        UPDATE face_search_jobs
+        SET
+            status = 'PROCESSING',
+            total_candidates = %s,
+            progress_percent = 35,
+            progress_message = 'Database face candidates loaded. Comparing faces now.',
+            error_message = NULL,
+            started_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                total_candidates,
+                job_id
+            )
+        )
+        updated_rows = self.cursor.rowcount
+        self.connection.commit()
+
+        if updated_rows:
+            logger.info(
+                "Face search DB state: job_id=%s status=PROCESSING total_candidates=%s",
+                job_id,
+                total_candidates
+            )
+        else:
+            logger.error(
+                "Face search DB state update failed: job_id=%s status=PROCESSING reason=job_not_found",
+                job_id
+            )
+
+    def complete_face_search_job(
+        self,
+        job_id,
+        result_payload,
+        total_candidates
+    ):
+        """Persist a completed face-search result for polling and later display."""
+
+        serialized_payload = json.dumps(result_payload or {})
+        query = """
+        UPDATE face_search_jobs
+        SET
+            status = 'COMPLETED',
+            total_candidates = %s,
+            progress_percent = 100,
+            progress_message = 'Face search completed.',
+            result = %s::jsonb,
+            error_message = NULL,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        RETURNING
+            job_id,
+            status,
+            uploaded_image_path,
+            total_candidates,
+            progress_percent,
+            progress_message,
+            result,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                total_candidates,
+                serialized_payload,
+                job_id
+            )
+        )
+        row = self.cursor.fetchone()
+        self.connection.commit()
+        formatted_job = self._format_face_search_job_row(row)
+
+        if formatted_job:
+            logger.info(
+                "Face search DB state: job_id=%s status=COMPLETED matched=%s best_score=%s",
+                job_id,
+                formatted_job.get("matched"),
+                formatted_job.get("best_score")
+            )
+        else:
+            logger.error(
+                "Face search DB complete failed: job_id=%s reason=job_not_found",
+                job_id
+            )
+
+        return formatted_job
+
+    def mark_face_search_job_failed(
+        self,
+        job_id,
+        error_message
+    ):
+        """Persist a failed face-search state and its error message."""
+
+        query = """
+        UPDATE face_search_jobs
+        SET
+            status = 'FAILED',
+            progress_percent = 100,
+            progress_message = 'Face search failed.',
+            error_message = %s,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        """
+
+        normalized_error = str(error_message or "Unknown face search error")
+        self.cursor.execute(
+            query,
+            (
+                normalized_error,
+                job_id
+            )
+        )
+        updated_rows = self.cursor.rowcount
+        self.connection.commit()
+
+        if updated_rows:
+            logger.error(
+                "Face search DB state: job_id=%s status=FAILED error=%s",
+                job_id,
+                normalized_error
+            )
+        else:
+            logger.error(
+                "Face search DB state update failed: job_id=%s status=FAILED reason=job_not_found error=%s",
+                job_id,
+                normalized_error
+            )
+
+    def update_face_search_job_progress(
+        self,
+        job_id,
+        progress_percent,
+        progress_message
+    ):
+        """Update visible face-search progress for dashboard polling."""
+
+        query = """
+        UPDATE face_search_jobs
+        SET
+            progress_percent = %s,
+            progress_message = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                int(progress_percent),
+                str(progress_message or ""),
+                job_id
+            )
+        )
+        self.connection.commit()
+
+    def mark_stale_face_search_jobs_failed(
+        self,
+        max_age_minutes=30
+    ):
+        """Fail face-search jobs that exceeded the allowed processing window."""
+
+        try:
+            stale_minutes = max(
+                1,
+                int(max_age_minutes or 30)
+            )
+        except (TypeError, ValueError):
+            stale_minutes = 30
+
+        error_message = (
+            "Face search job timed out before completion. "
+            f"No final result was saved within {stale_minutes} minutes. "
+            "Likely causes: face engine stopped, backend restarted, network timeout, "
+            "or a long-running comparison failure."
+        )
+        query = """
+        UPDATE face_search_jobs
+        SET
+            status = 'FAILED',
+            progress_percent = 100,
+            progress_message = 'Face search timed out.',
+            error_message = %s,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status IN ('PENDING', 'PROCESSING')
+        AND COALESCE(started_at, created_at) < (
+            CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+        )
+        RETURNING job_id
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                error_message,
+                stale_minutes
+            )
+        )
+        rows = self.cursor.fetchall()
+        self.connection.commit()
+        expired_job_ids = [
+            row[0]
+            for row in rows
+        ]
+
+        if expired_job_ids:
+            logger.error(
+                "Face search stale jobs marked failed: count=%s max_age_minutes=%s job_ids=%s",
+                len(expired_job_ids),
+                stale_minutes,
+                expired_job_ids
+            )
+
+        return expired_job_ids
+
+    def get_face_search_job(
+        self,
+        job_id
+    ):
+        """Fetch one face-search job for dashboard polling and final display."""
+
+        query = """
+        SELECT
+            job_id,
+            status,
+            uploaded_image_path,
+            total_candidates,
+            progress_percent,
+            progress_message,
+            result,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        FROM face_search_jobs
+        WHERE job_id = %s
+        LIMIT 1
+        """
+
+        self.cursor.execute(
+            query,
+            (job_id,)
+        )
+
+        return self._format_face_search_job_row(
+            self.cursor.fetchone()
+        )
+
+    def _next_document_validation_job_id(self):
+        """Generate the next readable document-validation job ID like DOC00001."""
+
+        self.cursor.execute(
+            """
+            SELECT 'DOC' || LPAD(nextval('document_validation_job_number_seq')::TEXT, 5, '0')
+            """
+        )
+
+        return self.cursor.fetchone()[0]
+
+    def create_document_validation_job(
+        self,
+        document_type,
+        uploaded_document_path,
+        original_filename,
+        manual_values
+    ):
+        """Insert a pending document-validation job and return its payload."""
+
+        job_id = self._next_document_validation_job_id()
+        query = """
+        INSERT INTO document_validation_jobs (
+            job_id,
+            status,
+            document_type,
+            uploaded_document_path,
+            original_filename,
+            manual_values,
+            progress_percent,
+            progress_message
+        )
+        VALUES (%s, 'PENDING', %s, %s, %s, %s::jsonb, 10, 'Document uploaded. Waiting to start validation.')
+        RETURNING
+            job_id,
+            status,
+            document_type,
+            uploaded_document_path,
+            original_filename,
+            manual_values,
+            progress_percent,
+            progress_message,
+            result,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                job_id,
+                document_type,
+                uploaded_document_path,
+                original_filename,
+                json.dumps(manual_values or {})
+            )
+        )
+        row = self.cursor.fetchone()
+        self.connection.commit()
+        formatted_job = self._format_document_validation_job_row(row)
+
+        logger.info(
+            "Document validation DB state: job_id=%s status=PENDING document_type=%s path=%s",
+            job_id,
+            document_type,
+            uploaded_document_path
+        )
+
+        return formatted_job
+
+    def mark_document_validation_job_processing(
+        self,
+        job_id
+    ):
+        """Move a document-validation job into processing."""
+
+        query = """
+        UPDATE document_validation_jobs
+        SET
+            status = 'PROCESSING',
+            progress_percent = 30,
+            progress_message = 'Document validation started. Checking document type and OCR.',
+            error_message = NULL,
+            started_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        """
+
+        self.cursor.execute(query, (job_id,))
+        updated_rows = self.cursor.rowcount
+        self.connection.commit()
+
+        if updated_rows:
+            logger.info(
+                "Document validation DB state: job_id=%s status=PROCESSING",
+                job_id
+            )
+        else:
+            logger.error(
+                "Document validation DB state update failed: job_id=%s status=PROCESSING reason=job_not_found",
+                job_id
+            )
+
+    def complete_document_validation_job(
+        self,
+        job_id,
+        result_payload
+    ):
+        """Persist a completed document-validation result for polling/display."""
+
+        serialized_payload = json.dumps(result_payload or {})
+        query = """
+        UPDATE document_validation_jobs
+        SET
+            status = 'COMPLETED',
+            progress_percent = 100,
+            progress_message = 'Document validation completed.',
+            result = %s::jsonb,
+            error_message = NULL,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        RETURNING
+            job_id,
+            status,
+            document_type,
+            uploaded_document_path,
+            original_filename,
+            manual_values,
+            progress_percent,
+            progress_message,
+            result,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                serialized_payload,
+                job_id
+            )
+        )
+        row = self.cursor.fetchone()
+        self.connection.commit()
+        formatted_job = self._format_document_validation_job_row(row)
+
+        if formatted_job:
+            decision = (formatted_job.get("result") or {}).get("decision") or {}
+            logger.info(
+                "Document validation DB state: job_id=%s status=COMPLETED decision=%s",
+                job_id,
+                decision.get("status")
+            )
+        else:
+            logger.error(
+                "Document validation DB complete failed: job_id=%s reason=job_not_found",
+                job_id
+            )
+
+        return formatted_job
+
+    def mark_document_validation_job_failed(
+        self,
+        job_id,
+        error_message
+    ):
+        """Persist a failed document-validation state and its error message."""
+
+        query = """
+        UPDATE document_validation_jobs
+        SET
+            status = 'FAILED',
+            progress_percent = 100,
+            progress_message = 'Document validation failed.',
+            error_message = %s,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        """
+
+        normalized_error = str(error_message or "Unknown document validation error")
+        self.cursor.execute(
+            query,
+            (
+                normalized_error,
+                job_id
+            )
+        )
+        updated_rows = self.cursor.rowcount
+        self.connection.commit()
+
+        if updated_rows:
+            logger.error(
+                "Document validation DB state: job_id=%s status=FAILED error=%s",
+                job_id,
+                normalized_error
+            )
+        else:
+            logger.error(
+                "Document validation DB state update failed: job_id=%s status=FAILED reason=job_not_found error=%s",
+                job_id,
+                normalized_error
+            )
+
+    def update_document_validation_job_progress(
+        self,
+        job_id,
+        progress_percent,
+        progress_message
+    ):
+        """Update visible document-validation progress for dashboard polling."""
+
+        query = """
+        UPDATE document_validation_jobs
+        SET
+            progress_percent = %s,
+            progress_message = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                int(progress_percent),
+                str(progress_message or ""),
+                job_id
+            )
+        )
+        self.connection.commit()
+
+    def mark_stale_document_validation_jobs_failed(
+        self,
+        max_age_minutes=30
+    ):
+        """Fail document-validation jobs that exceeded the allowed processing window."""
+
+        try:
+            stale_minutes = max(1, int(max_age_minutes or 30))
+        except (TypeError, ValueError):
+            stale_minutes = 30
+
+        error_message = (
+            "Document validation job timed out before completion. "
+            f"No final result was saved within {stale_minutes} minutes. "
+            "Likely causes: OCR process stopped, backend restarted, or a long-running verification failure."
+        )
+        query = """
+        UPDATE document_validation_jobs
+        SET
+            status = 'FAILED',
+            progress_percent = 100,
+            progress_message = 'Document validation timed out.',
+            error_message = %s,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status IN ('PENDING', 'PROCESSING')
+        AND COALESCE(started_at, created_at) < (
+            CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+        )
+        RETURNING job_id
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                error_message,
+                stale_minutes
+            )
+        )
+        rows = self.cursor.fetchall()
+        self.connection.commit()
+        expired_job_ids = [row[0] for row in rows]
+
+        if expired_job_ids:
+            logger.error(
+                "Document validation stale jobs marked failed: count=%s max_age_minutes=%s job_ids=%s",
+                len(expired_job_ids),
+                stale_minutes,
+                expired_job_ids
+            )
+
+        return expired_job_ids
+
+    def get_document_validation_job(
+        self,
+        job_id
+    ):
+        """Fetch one document-validation job for dashboard polling and display."""
+
+        query = """
+        SELECT
+            job_id,
+            status,
+            document_type,
+            uploaded_document_path,
+            original_filename,
+            manual_values,
+            progress_percent,
+            progress_message,
+            result,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        FROM document_validation_jobs
+        WHERE job_id = %s
+        LIMIT 1
+        """
+
+        self.cursor.execute(query, (job_id,))
+
+        return self._format_document_validation_job_row(
+            self.cursor.fetchone()
+        )
     def create_osint_job(
         self,
         targets,
@@ -348,13 +1218,31 @@ class DatabaseService:
         self.connection.commit()
         formatted_job = self._format_osint_job_row(row)
 
+        if not formatted_job or not formatted_job.get("job_id"):
+            logger.error(
+                "OSINT DB insert verification failed: job_id=%s reason=missing_returned_row",
+                job_id
+            )
+            raise ValueError("OSINT job could not be saved in the database")
+
+        persisted_job = self.get_osint_job(
+            formatted_job.get("job_id")
+        )
+
+        if not persisted_job:
+            logger.error(
+                "OSINT DB insert verification failed: job_id=%s reason=post_commit_lookup_missing",
+                formatted_job.get("job_id")
+            )
+            raise ValueError("OSINT job was not visible in the database after creation")
+
         logger.info(
-            "OSINT DB state: job_id=%s status=PENDING targets=%s",
-            formatted_job.get("job_id") if formatted_job else job_id,
+            "OSINT DB state: job_id=%s status=PENDING targets=%s persisted=True",
+            formatted_job.get("job_id"),
             len(targets or [])
         )
 
-        return formatted_job
+        return persisted_job
 
     def _next_osint_job_id(self):
         """Generate the next human-readable OSINT job ID like JOB00001."""
@@ -445,6 +1333,64 @@ class DatabaseService:
                 job_id,
                 str(error_message or "Unknown OSINT error")
             )
+
+    def mark_stale_osint_jobs_failed(
+        self,
+        max_age_minutes=15
+    ):
+        """Fail OSINT jobs that exceeded the allowed processing window."""
+
+        try:
+            stale_minutes = max(
+                1,
+                int(max_age_minutes or 15)
+            )
+        except (TypeError, ValueError):
+            stale_minutes = 15
+
+        error_message = (
+            "OSINT job timed out before completion. "
+            f"No completed webhook was received within {stale_minutes} minutes. "
+            "Likely causes: OSINT engine stopped, callback URL unreachable, "
+            "network/firewall issue, or provider processing failure."
+        )
+        query = """
+        UPDATE osint_jobs
+        SET
+            status = 'FAILED',
+            error_message = %s,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status IN ('PENDING', 'PROCESSING')
+        AND COALESCE(submitted_at, created_at) < (
+            CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+        )
+        RETURNING job_id
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                error_message,
+                stale_minutes
+            )
+        )
+        rows = self.cursor.fetchall()
+        self.connection.commit()
+        expired_job_ids = [
+            row[0]
+            for row in rows
+        ]
+
+        if expired_job_ids:
+            logger.error(
+                "OSINT stale jobs marked failed: count=%s max_age_minutes=%s job_ids=%s",
+                len(expired_job_ids),
+                stale_minutes,
+                expired_job_ids
+            )
+
+        return expired_job_ids
 
     def complete_osint_job(
         self,
@@ -605,6 +1551,283 @@ class DatabaseService:
             self.cursor.fetchone()
         )
 
+    def get_normalized_osint_data(
+        self,
+        job_id
+    ):
+        """Return normalized OSINT rows for clean dashboard retrieval."""
+
+        self.cursor.execute(
+            """
+            SELECT
+                platform,
+                target,
+                username,
+                full_name,
+                profile_url,
+                avatar_url,
+                avatar_path,
+                bio,
+                status,
+                confidence,
+                extracted_text
+            FROM osint_profiles
+            WHERE job_id = %s
+            ORDER BY id
+            """,
+            (job_id,)
+        )
+        profiles = [
+            {
+                "platform": row[0],
+                "target": row[1],
+                "username": row[2],
+                "full_name": row[3],
+                "profile_url": row[4],
+                "avatar_url": row[5],
+                "avatar_path": row[6],
+                "bio": row[7],
+                "status": row[8],
+                "confidence": row[9],
+                "extracted_text": row[10]
+            }
+            for row in self.cursor.fetchall()
+        ]
+
+        self.cursor.execute(
+            """
+            SELECT
+                contact_type,
+                target,
+                platform,
+                status,
+                category,
+                details
+            FROM osint_contacts
+            WHERE job_id = %s
+            ORDER BY id
+            """,
+            (job_id,)
+        )
+        contacts = [
+            {
+                "contact_type": row[0],
+                "target": row[1],
+                "platform": row[2],
+                "status": row[3],
+                "category": row[4],
+                "details": row[5]
+            }
+            for row in self.cursor.fetchall()
+        ]
+
+        self.cursor.execute(
+            """
+            SELECT
+                platform,
+                url,
+                bio,
+                avatar_url,
+                avatar_path,
+                confidence
+            FROM osint_matches
+            WHERE job_id = %s
+            ORDER BY id
+            """,
+            (job_id,)
+        )
+        matches = [
+            {
+                "platform": row[0],
+                "url": row[1],
+                "bio": row[2],
+                "avatar_url": row[3],
+                "avatar_path": row[4],
+                "confidence": row[5]
+            }
+            for row in self.cursor.fetchall()
+        ]
+
+        return {
+            "profiles": profiles,
+            "contacts": contacts,
+            "matches": matches
+        }
+
+    def replace_normalized_osint_data(
+        self,
+        job_id,
+        profiles=None,
+        contacts=None,
+        matches=None,
+        identity_links=None
+    ):
+        """Replace searchable OSINT rows for one job without touching raw JSON."""
+
+        profiles = profiles or []
+        contacts = contacts or []
+        matches = matches or []
+        identity_links = identity_links or []
+
+        try:
+
+            for table_name in (
+                "osint_identity_links",
+                "osint_matches",
+                "osint_contacts",
+                "osint_profiles"
+            ):
+
+                self.cursor.execute(
+                    f"DELETE FROM {table_name} WHERE job_id = %s",
+                    (job_id,)
+                )
+
+            for profile in profiles:
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO osint_profiles (
+                        job_id,
+                        employee_id,
+                        platform,
+                        target,
+                        username,
+                        full_name,
+                        profile_url,
+                        avatar_url,
+                        avatar_path,
+                        bio,
+                        status,
+                        confidence,
+                        extracted_text,
+                        raw_payload
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb
+                    )
+                    """,
+                    (
+                        job_id,
+                        profile.get("employee_id"),
+                        profile.get("platform"),
+                        profile.get("target"),
+                        profile.get("username"),
+                        profile.get("full_name"),
+                        profile.get("profile_url"),
+                        profile.get("avatar_url"),
+                        profile.get("avatar_path"),
+                        profile.get("bio"),
+                        profile.get("status"),
+                        profile.get("confidence"),
+                        profile.get("extracted_text"),
+                        json.dumps(profile.get("raw_payload") or {})
+                    )
+                )
+
+            for contact in contacts:
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO osint_contacts (
+                        job_id,
+                        employee_id,
+                        contact_type,
+                        target,
+                        platform,
+                        status,
+                        category,
+                        details,
+                        raw_payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        job_id,
+                        contact.get("employee_id"),
+                        contact.get("contact_type"),
+                        contact.get("target"),
+                        contact.get("platform"),
+                        contact.get("status"),
+                        contact.get("category"),
+                        contact.get("details"),
+                        json.dumps(contact.get("raw_payload") or {})
+                    )
+                )
+
+            for match in matches:
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO osint_matches (
+                        job_id,
+                        employee_id,
+                        platform,
+                        url,
+                        bio,
+                        avatar_url,
+                        avatar_path,
+                        confidence,
+                        raw_payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        job_id,
+                        match.get("employee_id"),
+                        match.get("platform"),
+                        match.get("url"),
+                        match.get("bio"),
+                        match.get("avatar_url"),
+                        match.get("avatar_path"),
+                        match.get("confidence"),
+                        json.dumps(match.get("raw_payload") or {})
+                    )
+                )
+
+            for identity_link in identity_links:
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO osint_identity_links (
+                        job_id,
+                        employee_id,
+                        link_reason,
+                        match_score,
+                        face_match_status,
+                        face_score,
+                        decision
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id,
+                        identity_link.get("employee_id"),
+                        identity_link.get("link_reason"),
+                        identity_link.get("match_score"),
+                        identity_link.get("face_match_status"),
+                        identity_link.get("face_score"),
+                        identity_link.get("decision")
+                    )
+                )
+
+            self.connection.commit()
+
+            logger.info(
+                "OSINT normalized data stored: job_id=%s profiles=%s contacts=%s matches=%s identity_links=%s",
+                job_id,
+                len(profiles),
+                len(contacts),
+                len(matches),
+                len(identity_links)
+            )
+
+        except Exception:
+
+            self.connection.rollback()
+            raise
+
     def _format_osint_job_row(
         self,
         row
@@ -626,6 +1849,73 @@ class DatabaseService:
             "submitted_at": row[7].isoformat() if row[7] else None,
             "completed_at": row[8].isoformat() if row[8] else None,
             "updated_at": row[9].isoformat() if row[9] else None
+        }
+
+    def _format_document_validation_job_row(
+        self,
+        row
+    ):
+        """Convert a document-validation SQL row into dashboard/API shape."""
+
+        if not row:
+
+            return None
+
+        result_payload = row[8] or {}
+
+        return {
+            "job_id": row[0],
+            "status": row[1],
+            "document_type": row[2],
+            "uploaded_document_path": row[3],
+            "original_filename": row[4],
+            "manual_values": row[5] or {},
+            "progress_percent": row[6] or 0,
+            "progress_message": row[7],
+            "result": result_payload,
+            "decision": result_payload.get("decision"),
+            "extracted_data": result_payload.get("extracted_data"),
+            "database_match": result_payload.get("database_match"),
+            "face_verification": result_payload.get("face_verification"),
+            "risk_assessment": result_payload.get("risk_assessment"),
+            "manual_review_case": result_payload.get("manual_review_case"),
+            "error_message": row[9],
+            "created_at": row[10].isoformat() if row[10] else None,
+            "started_at": row[11].isoformat() if row[11] else None,
+            "completed_at": row[12].isoformat() if row[12] else None,
+            "updated_at": row[13].isoformat() if row[13] else None
+        }
+
+    def _format_face_search_job_row(
+        self,
+        row
+    ):
+        """Convert a face-search SQL row into the API/dashboard payload shape."""
+
+        if not row:
+
+            return None
+
+        result_payload = row[6] or {}
+
+        return {
+            "job_id": row[0],
+            "status": row[1],
+            "uploaded_image_path": row[2],
+            "total_candidates": row[3],
+            "progress_percent": row[4] or 0,
+            "progress_message": row[5],
+            "result": result_payload,
+            "matched": result_payload.get("matched"),
+            "best_score": result_payload.get("best_score"),
+            "database_match": result_payload.get("database_match"),
+            "face_verification": result_payload.get("face_verification"),
+            "top_candidates": result_payload.get("top_candidates", []),
+            "error_message": row[7],
+            "created_at": row[8].isoformat() if row[8] else None,
+            "started_at": row[9].isoformat() if row[9] else None,
+            "completed_at": row[10].isoformat() if row[10] else None,
+            "updated_at": row[11].isoformat() if row[11] else None
         }
 
     # -----------------------------------

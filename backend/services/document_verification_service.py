@@ -44,16 +44,7 @@ class DocumentVerificationService:
         document,
         manual_values=None
     ):
-        """Run the full verification pipeline for one uploaded document.
-
-        Flow:
-        1. Save the uploaded image.
-        2. Run the specialized OCR model and normalize extracted fields.
-        3. Apply optional manual overrides from the UI.
-        4. Match the document number against the identity database.
-        5. Compare document face with the matched database profile photo.
-        6. Score risk, build the decision, and create manual review if needed.
-        """
+        """Run document verification for one uploaded file object."""
 
         manual_values = manual_values or {}
 
@@ -65,16 +56,51 @@ class DocumentVerificationService:
 
         saved_file_path = self.file_service.save_upload(document)
 
+        return self.verify_saved_file(
+            document_type=document_type,
+            saved_file_path=saved_file_path,
+            original_filename=document.filename,
+            manual_values=manual_values
+        )
+
+    def verify_saved_file(
+        self,
+        document_type,
+        saved_file_path,
+        original_filename="uploaded_document",
+        manual_values=None,
+        progress_callback=None
+    ):
+        """Run the full verification pipeline for an already-saved document image."""
+
+        manual_values = manual_values or {}
+        progress_callback = progress_callback or (lambda percent, message: None)
+
+        self.logger.info(
+            "Document verification processing saved file: document_type=%s filename=%s path=%s",
+            document_type,
+            original_filename,
+            saved_file_path
+        )
+
         self.logger.info("Document upload saved: path=%s", saved_file_path)
 
         classification = self._validate_selected_document_type(
             document_type,
             saved_file_path
         )
+        progress_callback(
+            35,
+            "Document type checked. Running OCR."
+        )
 
         extracted_text = self.ocr_service.extract_text(
             saved_file_path,
             document_type
+        )
+        progress_callback(
+            50,
+            "OCR completed. Extracting identity fields."
         )
 
         self.logger.info("OCR completed: document_type=%s", document_type)
@@ -100,6 +126,10 @@ class DocumentVerificationService:
             extracted_data,
             classification
         )
+        progress_callback(
+            60,
+            "Identity fields extracted. Applying manual overrides."
+        )
 
         self._apply_manual_values(
             extracted_data,
@@ -108,6 +138,10 @@ class DocumentVerificationService:
 
         database_match = self.database_service.verify_identity_document(
             extracted_data
+        )
+        progress_callback(
+            75,
+            "Database verification completed. Checking face match."
         )
 
         self._apply_ocr_correction_metadata(
@@ -122,11 +156,19 @@ class DocumentVerificationService:
         )
 
         face_result = self._verify_face(database_match)
+        progress_callback(
+            85,
+            "Face verification completed. Calculating risk."
+        )
 
         risk_assessment = self.risk_service.calculate(
             extracted_data,
             database_match,
             face_result
+        )
+        progress_callback(
+            92,
+            "Risk score calculated. Building final decision."
         )
 
         self.logger.info(
@@ -155,6 +197,10 @@ class DocumentVerificationService:
             decision,
             saved_file_path
         )
+        progress_callback(
+            98,
+            "Final decision built. Saving result."
+        )
 
         self.logger.info(
             "Document verification completed: document_type=%s status=%s",
@@ -171,7 +217,6 @@ class DocumentVerificationService:
             "decision": decision,
             "manual_review_case": manual_review_case
         }
-
     def _validate_selected_document_type(
         self,
         selected_document_type,
