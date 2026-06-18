@@ -10,21 +10,26 @@ import html
 import os
 import re
 import uuid
+import base64
 
 import requests
 import streamlit as st
+from PIL import Image
+from PIL import UnidentifiedImageError
 
 
 API_URL = "http://127.0.0.1:8000/search-identity"
 ADVANCED_SEARCH_URL = "http://127.0.0.1:8000/search-identity-advanced"
 VALIDATE_ID_URL = "http://127.0.0.1:8000/validate-id"
+DOCUMENT_VALIDATION_JOBS_URL = "http://127.0.0.1:8000/api/v1/jobs/document-validation"
 EXTRACT_DOCUMENT_FIELDS_URL = "http://127.0.0.1:8000/extract-document-fields"
 FACE_SEARCH_URL = "http://127.0.0.1:8000/search-by-face"
-REGISTER_IDENTITY_URL = "http://127.0.0.1:8000/register-identity"
+FACE_SEARCH_JOBS_URL = "http://127.0.0.1:8000/api/v1/jobs/face-search"
 MANUAL_REVIEW_URL = "http://127.0.0.1:8000/manual-review-cases"
 ADMIN_IDENTITIES_URL = "http://127.0.0.1:8000/admin/identities"
 OSINT_JOBS_URL = "http://127.0.0.1:8000/api/v1/osint/jobs"
 OSINT_SUBMIT_URL = "http://127.0.0.1:8000/api/v1/osint/jobs"
+OSINT_AVATAR_VERIFY_URL = "http://127.0.0.1:8000/api/v1/osint/jobs"
 NEWS_TOP_CLUSTERS_URL = "http://127.0.0.1:8000/api/v1/news/clusters/top"
 NEWS_SEARCH_URL = "http://127.0.0.1:8000/api/v1/news/search"
 NEWS_TOPICS_URL = "http://127.0.0.1:8000/api/v1/news/topics"
@@ -695,6 +700,32 @@ st.markdown(
             background: #e8f5f7;
         }
 
+        .identity-results-table {
+            min-width: 1900px;
+            table-layout: auto;
+        }
+
+        .identity-results-table th:first-child,
+        .identity-results-table td:first-child {
+            min-width: 230px;
+            width: 230px;
+            text-align: center;
+        }
+
+        .identity-results-table td:first-child {
+            vertical-align: middle;
+        }
+
+        .identity-results-table td:first-child img {
+            width: 190px !important;
+            height: 190px !important;
+            max-width: none !important;
+            object-fit: contain !important;
+            display: block;
+            margin: 0 auto;
+            background: #ffffff;
+        }
+
         .table-link {
             color: #0f5e73 !important;
             font-weight: 750;
@@ -816,6 +847,55 @@ st.markdown(
             font-weight: 700;
         }
 
+        .keyword-chip-row {
+            display: flex;
+            flex-wrap: nowrap;
+            gap: 8px;
+            overflow-x: auto;
+            padding: 4px 0 8px 0;
+            margin-top: -4px;
+        }
+
+        .keyword-chip {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 30px;
+            padding: 5px 11px;
+            border-radius: 999px;
+            border: 1px solid #b8dfe6;
+            background: #ffffff;
+            color: #0f5e73 !important;
+            font-size: 12px;
+            font-weight: 850;
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .keyword-chip:hover {
+            background: #e8f5f7;
+            text-decoration: none;
+        }
+
+        div[data-testid="stMarkdownContainer"]:has(.keyword-chip-marker) + div [data-testid="column"] {
+            width: auto !important;
+            flex: 0 0 auto !important;
+        }
+
+        div[data-testid="stMarkdownContainer"]:has(.keyword-chip-marker) + div .stButton button {
+            min-height: 30px !important;
+            height: 30px !important;
+            padding: 4px 10px !important;
+            border-radius: 999px !important;
+            font-size: 12px !important;
+            font-weight: 850 !important;
+            white-space: nowrap !important;
+            background: #ffffff !important;
+            border: 1px solid #b8dfe6 !important;
+            color: #0f5e73 !important;
+        }
+
         .news-source-list {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -928,10 +1008,8 @@ SEARCH_OPTIONS = {
 }
 
 OSINT_FIELD_LABELS = {
-    "full_name": "Full Name",
-    "username": "Username",
-    "email": "Email",
-    "phone_number": "Phone Number"
+    value: label
+    for label, value in SEARCH_OPTIONS.items()
 }
 
 OSINT_ELIGIBLE_FIELDS = set(OSINT_FIELD_LABELS)
@@ -953,23 +1031,13 @@ NAVIGATION_SECTIONS = [
         "accent": "#2563eb"
     },
     {
-        "label": "Manual Review",
-        "description": "Resolve document cases that need operator approval or record updates.",
-        "accent": "#9a5b00"
-    },
-    {
         "label": "Admin Operations",
         "description": "Load, create, update, and delete identity records from the database.",
         "accent": "#087443"
     },
     {
-        "label": "Register Identity",
-        "description": "Register a new verified identity with documents and profile photo.",
-        "accent": "#7c3aed"
-    },
-    {
         "label": "News Intelligence",
-        "description": "Explore top news clusters, related articles, sources, and entities.",
+        "description": "Explore top news, related articles, sources, and entities.",
         "accent": "#be185d"
     }
 ]
@@ -1073,6 +1141,9 @@ def formatted_table_cell(value):
     if value is None or value == "":
         return "-"
 
+    if is_base64_like_value(value):
+        return "[hidden base64 data]"
+
     if isinstance(value, list):
         if not value:
             return "-"
@@ -1083,15 +1154,33 @@ def formatted_table_cell(value):
             value = json.dumps(value, ensure_ascii=False)
 
     if isinstance(value, dict):
+        image_html = avatar_image_html(
+            value.get("image_path"),
+            value.get("image_url"),
+            size=value.get("image_size") or 128,
+            object_fit=value.get("image_fit") or "cover"
+        )
+
+        if image_html:
+            return image_html
+
+        if "image_path" in value or "image_url" in value:
+            return "-"
+
         value = json.dumps(value, ensure_ascii=False)
 
     value = str(value)
+    image_html = local_image_html(value)
+
+    if image_html:
+        return image_html
+
     escaped_value = html.escape(value)
 
     if value.startswith(("http://", "https://")):
         return (
             f'<a class="table-link" href="{escaped_value}" '
-            f'target="_blank" rel="noopener noreferrer">{escaped_value}</a>'
+            'target="_blank" rel="noopener noreferrer">View</a>'
         )
 
     if "\n" in value:
@@ -1100,7 +1189,201 @@ def formatted_table_cell(value):
     return escaped_value
 
 
-def render_light_table(rows, columns, empty_message):
+def local_image_html(
+    value,
+    size=128,
+    object_fit="cover"
+):
+    """Render a local decoded OSINT image path as a safe HTML thumbnail."""
+
+    if not isinstance(value, str):
+        return ""
+
+    if not value.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return ""
+
+    image_info = local_image_info(value)
+
+    if not image_info:
+        return ""
+
+    resolved_path = image_info["path"]
+    mime_type = image_info["mime_type"]
+
+    with open(resolved_path, "rb") as image_file:
+        encoded_image = base64.b64encode(image_file.read()).decode("ascii")
+
+    return (
+        f'<img src="data:{mime_type};base64,{encoded_image}" '
+        'alt="OSINT avatar image" '
+        f'style="width:{int(size)}px;height:{int(size)}px;object-fit:{html.escape(str(object_fit))};border-radius:10px;'
+        'border:1px solid #d8e3ec;" />'
+    )
+
+
+def remote_image_html(
+    value,
+    size=128,
+    object_fit="cover"
+):
+    """Render a remote avatar URL as a dashboard thumbnail."""
+
+    if not isinstance(value, str):
+        return ""
+
+    if not value.startswith(("http://", "https://")):
+        return ""
+
+    escaped_value = html.escape(value)
+
+    return (
+        f'<a href="{escaped_value}" target="_blank" rel="noopener noreferrer">'
+        f'<img src="{escaped_value}" alt="Avatar image" '
+        "onerror=\"this.closest('a').replaceWith(document.createTextNode('-'))\" "
+        f'style="width:{int(size)}px;height:{int(size)}px;object-fit:{html.escape(str(object_fit))};border-radius:10px;'
+        'border:1px solid #d8e3ec;background:#ffffff;" />'
+        '</a>'
+    )
+
+
+def avatar_image_html(
+    image_path=None,
+    image_url=None,
+    size=128,
+    object_fit="cover"
+):
+    """Prefer validated local avatar images, then fall back to remote URLs."""
+
+    return (
+        local_image_html(
+            image_path,
+            size=size,
+            object_fit=object_fit
+        )
+        or remote_image_html(
+            image_url,
+            size=size,
+            object_fit=object_fit
+        )
+    )
+
+
+def local_image_info(image_path):
+    """Resolve and validate a local image, returning its real MIME type."""
+
+    if not image_path:
+        return None
+
+    if not str(image_path).lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return None
+
+    try:
+        resolved_path = resolve_photo_path(image_path)
+    except NameError:
+        return None
+
+    if not resolved_path or not os.path.exists(resolved_path):
+        return None
+
+    try:
+        with Image.open(resolved_path) as image:
+            image.verify()
+            image_format = (image.format or "").upper()
+    except (OSError, UnidentifiedImageError, ValueError):
+        return None
+
+    mime_types = {
+        "JPEG": "image/jpeg",
+        "JPG": "image/jpeg",
+        "PNG": "image/png",
+        "WEBP": "image/webp"
+    }
+    mime_type = mime_types.get(image_format)
+
+    if not mime_type:
+        return None
+
+    return {
+        "path": resolved_path,
+        "mime_type": mime_type
+    }
+
+
+def local_image_path_exists(image_path):
+    """Return True when a local avatar path resolves to an existing image."""
+
+    return bool(local_image_info(image_path))
+
+
+def avatar_row_has_usable_image(row):
+    """Return True only for rows with an existing local image or remote image URL."""
+
+    if not isinstance(row, dict):
+        return False
+
+    image_path = row.get("avatar_path")
+    image_url = (
+        row.get("avatar_url")
+        or extract_avatar_url(row.get("enriched_data") or row)
+    )
+
+    return local_image_path_exists(image_path)
+
+
+def avatar_image_value(row):
+    """Build an avatar display value from a normalized or raw OSINT row."""
+
+    if not isinstance(row, dict):
+        return None
+
+    image_path = row.get("avatar_path")
+    image_url = (
+        row.get("avatar_url")
+        or extract_avatar_url(row.get("enriched_data") or row)
+    )
+
+    if not local_image_path_exists(image_path):
+        image_path = None
+
+    if not str(image_url or "").startswith(("http://", "https://")):
+        image_url = None
+
+    if not image_path and not image_url:
+        return None
+
+    return {
+        "image_path": image_path,
+        "image_url": image_url
+    }
+
+
+def is_base64_like_value(value):
+    """Return True for large image/base64 blobs that should not be displayed."""
+
+    if not isinstance(value, str):
+        return False
+
+    stripped_value = value.strip()
+
+    if stripped_value.startswith("data:image"):
+        return True
+
+    if len(stripped_value) < 120:
+        return False
+
+    compact_value = stripped_value.replace("\n", "").replace("\r", "")
+
+    if compact_value.startswith(("/9j/", "iVBOR", "AAAA")):
+        return True
+
+    allowed_characters = set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+    )
+
+    return all(character in allowed_characters for character in compact_value[:240])
+
+
+def render_light_table(rows, columns, empty_message, table_class="admin-table"):
     """Render a reusable themed table from rows and column accessors."""
 
     header_cells = "".join(
@@ -1130,7 +1413,7 @@ def render_light_table(rows, columns, empty_message):
     st.markdown(
         f"""
         <div class="admin-table-wrap">
-            <table class="admin-table">
+            <table class="{html.escape(table_class)}">
                 <thead><tr>{header_cells}</tr></thead>
                 <tbody>{''.join(body_rows)}</tbody>
             </table>
@@ -1196,7 +1479,7 @@ def render_header():
         """
         <div class="app-header">
             <div class="eyebrow">Identity Verification Command Center</div>
-            <h1 class="app-title">Search, validate, register, and match identities from one secure console</h1>
+            <h1 class="app-title">Search, validate, review, and match identities from one secure console</h1>
             <div class="app-subtitle">
                 Document OCR, PostgreSQL identity verification, database photo matching, and direct face search
                 are connected into one operator-ready workflow.
@@ -1231,6 +1514,9 @@ def render_sidebar_navigation():
         """,
         unsafe_allow_html=True
     )
+
+    if st.session_state.get("active_dashboard_section") not in NAVIGATION_LABELS:
+        st.session_state["active_dashboard_section"] = NAVIGATION_LABELS[0]
 
     selected_section = st.sidebar.radio(
         "Workspace",
@@ -1331,7 +1617,7 @@ def safe_json_response(response):
         }
 
 
-def post_request(url, data=None, files=None, timeout=180):
+def post_request(url, data=None, files=None, json_body=None, timeout=180):
     """POST to the backend and normalize connection/JSON errors."""
 
     try:
@@ -1339,6 +1625,7 @@ def post_request(url, data=None, files=None, timeout=180):
             url,
             data=data,
             files=files,
+            json=json_body,
             timeout=timeout
         )
         return response, safe_json_response(response)
@@ -1426,6 +1713,27 @@ def render_face_evidence(left_label, left_path, right_label, right_path):
             st.image(resolved_right_path, width=210)
         else:
             st.warning("Image not available")
+
+
+def render_persistent_upload_preview(
+    uploaded_file,
+    saved_path,
+    waiting_message,
+    width
+):
+    """Show the live uploaded file, then fall back to the saved job file path."""
+
+    if uploaded_file is not None:
+        st.image(uploaded_file, width=width)
+        return
+
+    resolved_path = resolve_photo_path(saved_path)
+
+    if resolved_path:
+        st.image(resolved_path, width=width)
+        return
+
+    status_panel(waiting_message, "neutral")
 
 
 def render_decision(decision, face_verification):
@@ -1935,172 +2243,628 @@ def render_generic_osint_section(section_key, section_value):
     )
 
 
-def render_osint_results(results):
-    """Render OSINT provider results as dashboard tables instead of raw JSON."""
+def first_non_empty(*values):
+    """Return the first meaningful value from a list of candidates."""
 
-    results = results or {}
-    known_result_keys = {
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+
+    return None
+
+
+def key_has_any_token(key, tokens):
+    """Check whether a payload key contains any matching token."""
+
+    normalized_key = str(key or "").lower()
+
+    return any(token in normalized_key for token in tokens)
+
+
+def find_nested_url(value, key_tokens, excluded_key_tokens=None):
+    """Find the first valid URL stored under keys that match token hints."""
+
+    excluded_key_tokens = excluded_key_tokens or []
+
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            if key_has_any_token(key, excluded_key_tokens):
+                continue
+
+            if (
+                key_has_any_token(key, key_tokens)
+                and isinstance(nested_value, str)
+                and nested_value.startswith(("http://", "https://"))
+                and not is_base64_like_value(nested_value)
+            ):
+                return nested_value
+
+        for key, nested_value in value.items():
+            if key_has_any_token(key, excluded_key_tokens):
+                continue
+
+            found_url = find_nested_url(
+                nested_value,
+                key_tokens,
+                excluded_key_tokens
+            )
+
+            if found_url:
+                return found_url
+
+    if isinstance(value, list):
+        for nested_value in value:
+            found_url = find_nested_url(
+                nested_value,
+                key_tokens,
+                excluded_key_tokens
+            )
+
+            if found_url:
+                return found_url
+
+    return None
+
+
+def extract_profile_url(row):
+    """Extract the most likely public profile URL from an OSINT row."""
+
+    return first_non_empty(
+        row.get("profile_url"),
+        row.get("profileUrl"),
+        row.get("url"),
+        row.get("link"),
+        find_nested_url(
+            row,
+            ["profile", "url", "link"],
+            ["avatar", "image", "photo", "base64"]
+        )
+    )
+
+
+def extract_avatar_url(row):
+    """Extract the most likely avatar/photo URL from an OSINT row."""
+
+    return first_non_empty(
+        row.get("avatar_url"),
+        row.get("avatarUrl"),
+        row.get("image_url"),
+        row.get("photo_url"),
+        find_nested_url(
+            row,
+            ["avatar", "image", "photo", "picture"],
+            ["base64"]
+        )
+    )
+
+
+def should_hide_extracted_field(key, value):
+    """Decide which OSINT fields should move to columns or stay hidden."""
+
+    if is_base64_like_value(value):
+        return True
+
+    normalized_key = str(key or "").lower()
+    hidden_tokens = [
+        "base64",
+        "avatar_url",
+        "avatarurl",
+        "profile_url",
+        "profileurl",
+        "image_url",
+        "photo_url",
+        "url",
+        "link"
+    ]
+
+    return any(token in normalized_key for token in hidden_tokens)
+
+
+def is_phone_or_email_platform(platform):
+    """Return True when an enriched row is actually phone/email intelligence."""
+
+    normalized_platform = str(platform or "").lower()
+    phone_email_tokens = [
+        "phone",
+        "phonenumber",
+        "phonenumbers",
+        "network",
+        "carrier",
+        "telecom",
+        "email",
+        "gmail",
+        "zerobounce",
+        "domain"
+    ]
+
+    return any(token in normalized_platform for token in phone_email_tokens)
+
+
+def readable_payload_text(value):
+    """Convert nested OSINT values into readable text instead of JSON."""
+
+    if value is None or value == "":
+        return "-"
+
+    if is_base64_like_value(value):
+        return "[hidden base64 data]"
+
+    if isinstance(value, dict):
+        lines = []
+
+        for key, nested_value in value.items():
+            if nested_value in (None, "", [], {}):
+                continue
+
+            if should_hide_extracted_field(key, nested_value):
+                continue
+
+            lines.append(
+                f"{humanize_payload_key(key)}: {readable_payload_text(nested_value)}"
+            )
+
+        return "\n".join(lines) if lines else "-"
+
+    if isinstance(value, list):
+        if not value:
+            return "-"
+
+        rendered_items = [
+            readable_payload_text(item)
+            for item in value
+            if item not in (None, "", [], {})
+        ]
+
+        return "\n".join(
+            f"{index}. {item}"
+            for index, item in enumerate(rendered_items, 1)
+        ) if rendered_items else "-"
+
+    return str(value)
+
+
+def flatten_social_media_results(results):
+    """Combine username, Instagram, Facebook, and future social results."""
+
+    social_rows = []
+    excluded_keys = {
         "inputs_processed",
-        "username_results",
-        "instagram_results",
         "phone_results",
         "email_results",
         "all_matches",
-        "profile_url"
-    }
-    inputs_processed = results.get("inputs_processed") or []
-    username_results = results.get("username_results") or []
-    instagram_results = results.get("instagram_results") or []
-    phone_results = results.get("phone_results") or []
-    email_results = results.get("email_results") or []
-    all_matches = results.get("all_matches") or []
-    extra_sections = {
-        key: value
-        for key, value in results.items()
-        if key not in known_result_keys
-        and value not in (None, "", [], {})
+        "profile_url",
+        "risk_notes"
     }
 
-    for instagram_result in instagram_results:
-        extracted_data = instagram_result.setdefault(
-            "extracted_data",
-            {}
-        )
-        if instagram_result.get("profile_url") and not extracted_data.get("profile_url"):
-            extracted_data["profile_url"] = instagram_result.get("profile_url")
+    for row in results.get("username_results") or []:
+        matches = row.get("matches") or []
 
-    metric_one, metric_two, metric_three, metric_four, metric_five = st.columns(5)
-    metric_one.metric("Username Results", len(username_results))
-    metric_two.metric("Instagram Results", len(instagram_results))
-    metric_three.metric("Phone Results", len(phone_results))
-    metric_four.metric("Email Results", len(email_results))
-    metric_five.metric("Other Sections", len(extra_sections))
+        if matches:
+            for match in matches:
+                if not isinstance(match, dict):
+                    continue
 
-    profile_links = collect_osint_urls(results, "OSINT Payload")
-    unique_profile_links = []
-    seen_urls = set()
-
-    for link in profile_links:
-        url = link.get("url")
-
-        if url in seen_urls:
+                enriched_data = match.get("enriched_data") or {}
+                social_rows.append(
+                    {
+                        "source": "Username Search",
+                        "target": row.get("target"),
+                        "platform": match.get("platform") or row.get("platform"),
+                        "status": match.get("status") or row.get("status"),
+                        "profile_url": extract_profile_url(match),
+                        "avatar_url": extract_avatar_url(match),
+                        "bio": enriched_data.get("bio"),
+                        "extracted_text": readable_payload_text(
+                            enriched_data
+                            or match.get("details")
+                            or match.get("message")
+                        )
+                    }
+                )
             continue
 
-        seen_urls.add(url)
-        unique_profile_links.append(link)
-
-    if unique_profile_links:
-        st.markdown("**Profile And Source URLs**")
-        render_light_table(
-            unique_profile_links,
-            [
-                ("Source", "source"),
-                ("URL", "url")
-            ],
-            "No profile URLs were returned."
+        social_rows.append(
+            {
+                "source": "Username Search",
+                "target": row.get("target"),
+                "platform": row.get("platform"),
+                "status": row.get("status"),
+                "profile_url": extract_profile_url(row),
+                "avatar_url": extract_avatar_url(row),
+                "bio": row.get("bio"),
+                "extracted_text": readable_payload_text(
+                    row.get("extracted_data")
+                    or row.get("details")
+                    or row.get("message")
+                )
+            }
         )
 
-    if inputs_processed:
-        st.markdown("**Inputs Processed**")
-        render_light_table(
-            [
+    for row in results.get("instagram_results") or []:
+        extracted_data = row.get("extracted_data") or {}
+        social_rows.append(
+            {
+                "source": "Instagram",
+                "target": row.get("target_username") or row.get("target"),
+                "platform": row.get("platform") or "Instagram",
+                "status": row.get("status"),
+                "profile_url": extract_profile_url(row),
+                "avatar_url": extract_avatar_url(row),
+                "extracted_text": readable_payload_text(extracted_data)
+            }
+        )
+
+    for section_key, section_value in results.items():
+        if section_key in excluded_keys or section_key in {
+            "username_results",
+            "instagram_results"
+        }:
+            continue
+
+        if not section_key.endswith("_results"):
+            continue
+
+        section_rows = section_value if isinstance(section_value, list) else [section_value]
+
+        for row in section_rows:
+            if not isinstance(row, dict):
+                continue
+
+            social_rows.append(
                 {
-                    "input": input_value
+                    "source": humanize_payload_key(section_key),
+                    "target": (
+                        row.get("target")
+                        or row.get("target_username")
+                        or row.get("username")
+                    ),
+                    "platform": row.get("platform") or humanize_payload_key(section_key),
+                    "status": row.get("status"),
+                    "profile_url": extract_profile_url(row),
+                    "avatar_url": extract_avatar_url(row),
+                    "extracted_text": readable_payload_text(
+                        row.get("extracted_data")
+                        or row.get("details")
+                        or row
+                    )
                 }
-                for input_value in inputs_processed
-            ],
-            [
-                ("Input", "input")
-            ],
-            "No processed inputs were returned."
+            )
+
+    if results.get("profile_url"):
+        social_rows.insert(
+            0,
+            {
+                "source": "Profile URL",
+                "target": "-",
+                "platform": "OSINT",
+                "status": "found",
+                "profile_url": results.get("profile_url"),
+                "avatar_url": extract_avatar_url(results),
+                "extracted_text": "-"
+            }
         )
 
-    st.markdown("**Username Results**")
+    return social_rows
+
+
+def render_osint_results(results, normalized=None):
+    """Render OSINT provider results in the requested focused order."""
+
+    results = results or {}
+    normalized = normalized or {}
+    phone_results = results.get("phone_results") or []
+    email_results = results.get("email_results") or []
+    social_media_results = normalized.get("profiles") or flatten_social_media_results(results)
+    normalized_contacts = normalized.get("contacts") or []
+    normalized_phone_results = [
+        contact
+        for contact in normalized_contacts
+        if contact.get("contact_type") == "phone"
+    ]
+    normalized_email_results = [
+        contact
+        for contact in normalized_contacts
+        if contact.get("contact_type") == "email"
+    ]
+
+    metric_one, metric_two, metric_three = st.columns(3)
+    metric_one.metric("Social Media", len(social_media_results))
+    metric_two.metric("Phone Results", len(normalized_phone_results or phone_results))
+    metric_three.metric("Email Results", len(normalized_email_results or email_results))
+
+    st.markdown("**Social Media Results**")
     render_light_table(
-        username_results,
+        social_media_results,
         [
             ("Target", "target"),
             ("Platform", "platform"),
-            ("URL", "url"),
-            ("Status", "status")
+            ("Avatar Image", avatar_image_value),
+            ("Bio / Extracted Text", lambda row: readable_payload_text(row.get("bio") or row.get("extracted_text"))),
+            ("Profile URL", "profile_url"),
+            ("Avatar URL", "avatar_url")
         ],
-        "No username results were returned."
-    )
-
-    st.markdown("**Instagram Results**")
-    render_light_table(
-        instagram_results,
-        [
-            ("Target", "target_username"),
-            ("Platform", "platform"),
-            ("Status", "status"),
-            ("Profile URL", "extracted_data.profile_url"),
-            ("Bio", "extracted_data.bio"),
-            ("Avatar URL", "extracted_data.avatar_url"),
-            ("Top Posts", "extracted_data.top_posts")
-        ],
-        "No Instagram results were returned."
+        "No social media results were returned."
     )
 
     st.markdown("**Phone Results**")
     render_light_table(
-        flatten_osint_match_results(phone_results),
+        normalized_phone_results or flatten_osint_match_results(phone_results),
         [
             ("Target", "target"),
-            ("Input Type", "input_type"),
-            ("Result Status", "result_status"),
+            ("Input Type", lambda row: row.get("contact_type") or row.get("input_type")),
+            ("Result Status", lambda row: row.get("status") or row.get("result_status")),
             ("Platform", "platform"),
-            ("Details", "details")
+            ("Details", lambda row: readable_payload_text(row.get("details")))
         ],
         "No phone results were returned."
     )
 
     st.markdown("**Email Results**")
     render_light_table(
-        flatten_osint_match_results(email_results),
+        normalized_email_results or flatten_osint_match_results(email_results),
         [
             ("Target", "target"),
-            ("Input Type", "input_type"),
-            ("Result Status", "result_status"),
+            ("Input Type", lambda row: row.get("contact_type") or row.get("input_type")),
+            ("Result Status", lambda row: row.get("status") or row.get("result_status")),
             ("Platform", "platform"),
-            ("Match Status", "match_status"),
-            ("Category", "category"),
-            ("Details", "details")
+            ("Details", lambda row: readable_payload_text(row.get("details")))
         ],
         "No email results were returned."
     )
 
-    st.markdown("**Enriched Matches**")
-    render_light_table(
-        all_matches,
-        [
-            ("Platform", "platform"),
-            ("URL", "url"),
-            ("Bio", "enriched_data.bio"),
-            ("Avatar URL", "enriched_data.avatar_url"),
-            ("Local Avatar Path", "enriched_data.local_avatar_path")
-        ],
-        "No enriched matches were returned."
+
+def dedupe_osint_avatar_candidates(candidates):
+    """Remove duplicate OSINT avatar candidates while keeping useful metadata."""
+
+    deduped = []
+    seen = set()
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        if not avatar_row_has_usable_image(candidate):
+            continue
+
+        profile_identity = str(
+            candidate.get("profile_url")
+            or candidate.get("url")
+            or ""
+        ).strip().lower().rstrip("/")
+        avatar_identity = str(
+            candidate.get("avatar_url")
+            or candidate.get("avatar_path")
+            or ""
+        ).strip().lower()
+
+        if profile_identity:
+            key = ("profile_url", profile_identity)
+        elif avatar_identity:
+            key = ("avatar", avatar_identity)
+        else:
+            key = (
+                "metadata",
+                str(candidate.get("platform") or "").lower(),
+                str(candidate.get("target") or "").lower(),
+                str(candidate.get("bio") or candidate.get("extracted_text") or "").lower()
+            )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(candidate)
+
+    return deduped
+
+
+def build_osint_avatar_candidates(job):
+    """Build avatar candidates from normalized rows and raw OSINT fallback data."""
+
+    job = job or {}
+    normalized = job.get("normalized") or {}
+    results = job.get("results") or {}
+    candidates = []
+
+    for section_key, source_label in (
+        ("profiles", "Social Profile"),
+        ("matches", "Enriched Match")
+    ):
+        for row in normalized.get(section_key) or []:
+            if not isinstance(row, dict):
+                continue
+
+            candidate = dict(row)
+            candidate["source"] = candidate.get("source") or source_label
+
+            if not candidate.get("profile_url") and candidate.get("url"):
+                candidate["profile_url"] = candidate.get("url")
+
+            candidates.append(candidate)
+
+    if results:
+        for row in flatten_social_media_results(results):
+            candidate = dict(row)
+            candidate["source"] = candidate.get("source") or "Raw Social Result"
+            candidates.append(candidate)
+
+        for row in results.get("all_matches") or []:
+            if not isinstance(row, dict):
+                continue
+
+            if is_phone_or_email_platform(row.get("platform")):
+                continue
+
+            candidate = dict(row)
+            candidate["source"] = candidate.get("source") or "Raw Enriched Match"
+            candidate["profile_url"] = candidate.get("profile_url") or candidate.get("url")
+            candidate["avatar_url"] = candidate.get("avatar_url") or extract_avatar_url(
+                candidate.get("enriched_data") or candidate
+            )
+            candidate["bio"] = candidate.get("bio") or nested_value(candidate, "enriched_data.bio")
+            candidates.append(candidate)
+
+    return dedupe_osint_avatar_candidates(candidates)
+
+
+def render_osint_avatar_verification(job):
+    """Verify OSINT avatars against DB faces and render final profile summary."""
+
+    job_id = (job or {}).get("job_id")
+
+    if not job_id:
+        return
+
+    avatar_profiles = build_osint_avatar_candidates(job)
+
+    st.markdown("**OSINT Images For Verification**")
+
+    if not avatar_profiles:
+        status_panel(
+            (
+                "No OSINT avatar images are available for face verification. "
+                "The job may contain profile text only, or the provider did not send "
+                "a usable avatar_url/avatar_base64 field."
+            ),
+            "warning"
+        )
+        return
+
+    status_panel(
+        "Review the OSINT avatar images below. Approve only the images you want to compare with registered database faces.",
+        "neutral"
     )
 
-    for section_key, section_value in extra_sections.items():
-        render_generic_osint_section(
-            section_key,
-            section_value
+    selected_profiles = []
+
+    for start_index in range(0, len(avatar_profiles), 3):
+        row_columns = st.columns(3, gap="large")
+
+        for offset, profile in enumerate(avatar_profiles[start_index:start_index + 3]):
+            profile_index = start_index + offset
+            checkbox_key = f"osint_avatar_select_{job_id}_{profile_index}"
+
+            with row_columns[offset]:
+                st.markdown(
+                    f"""
+                        <div class="news-card">
+                            <div class="news-card-title">{html.escape(str(profile.get("platform") or "Unknown Platform"))}</div>
+                            <div class="news-card-meta">Source: {html.escape(str(profile.get("source") or "-"))}</div>
+                            <div class="news-card-meta">Target: {html.escape(str(profile.get("target") or "-"))}</div>
+                            <div style="margin:10px 0;">{formatted_table_cell(avatar_image_value(profile))}</div>
+                            <div class="news-card-meta">Status: {html.escape(str(profile.get("status") or "-"))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+                if profile.get("profile_url"):
+                    st.markdown(f"[Open profile]({profile.get('profile_url')})")
+
+                approved = st.checkbox(
+                    "Approve for face search",
+                    value=True,
+                    key=checkbox_key
+                )
+
+                if approved:
+                    selected_profiles.append(profile)
+
+    verify_clicked = st.button(
+        "Verify Approved OSINT Avatars With Database Faces",
+        key=f"verify_osint_avatars_{job_id}",
+        type="primary",
+        use_container_width=True
+    )
+
+    result_key = f"osint_avatar_verification_{job_id}"
+
+    if verify_clicked:
+        if not selected_profiles:
+            status_panel("Select at least one OSINT avatar image before verification.", "danger")
+            return
+
+        with st.spinner("Comparing OSINT avatar images with database faces..."):
+            response, result = post_request(
+                f"{OSINT_AVATAR_VERIFY_URL}/{job_id}/verify-avatars",
+                json_body={
+                    "approved_avatars": selected_profiles
+                },
+                timeout=900
+            )
+
+        if response is None or response.status_code != 200:
+            status_panel(result.get("message", "OSINT avatar verification failed."), "danger")
+            return
+
+        st.session_state[result_key] = result
+
+    verification_result = st.session_state.get(result_key)
+
+    if not verification_result:
+        return
+
+    st.markdown("**Investigation Result**")
+    conclusion = verification_result.get("conclusion") or {}
+    decision = conclusion.get("decision")
+    summary = conclusion.get("summary") or "Verification summary unavailable."
+
+    if decision == "VERIFIED":
+        status_panel(summary, "success")
+    elif decision == "NO AVATAR":
+        status_panel(summary, "warning")
+    else:
+        status_panel(summary, "danger")
+
+    verified_identity = verification_result.get("verified_identity")
+    verification_rows = verification_result.get("avatar_verifications") or []
+    matched_rows = [
+        row
+        for row in verification_rows
+        if row.get("matched")
+    ]
+
+    metric_one, metric_two, metric_three = st.columns(3)
+    metric_one.metric("Approved Avatars Checked", len(verification_rows))
+    metric_two.metric("Face Matches", len(matched_rows))
+    metric_three.metric("Decision", decision or "-")
+
+    if verified_identity:
+        render_person(
+            verified_identity,
+            "Final Verified Profile Summary"
         )
 
-    with st.expander("Complete OSINT Payload Details"):
-        render_light_table(
-            flatten_payload_for_display(results, "osint"),
-            [
-                ("Field", "field"),
-                ("Value", "value")
-            ],
-            "No OSINT payload details were returned."
+        matched_platforms = ", ".join(
+            str(row.get("platform") or "-")
+            for row in matched_rows
         )
+        status_panel(
+            f"Investigative conclusion: OSINT avatar evidence from {matched_platforms or 'selected profiles'} matched the registered database identity.",
+            "success"
+        )
+
+    st.markdown("**Avatar Match Evidence**")
+    render_light_table(
+        verification_rows,
+        [
+            ("Platform", "platform"),
+            ("Target", "target"),
+            ("OSINT Avatar", avatar_image_value),
+            ("Profile URL", "profile_url"),
+            ("Matched", "matched"),
+            ("Best Score", "best_score"),
+            ("DB Employee ID", lambda row: (row.get("database_match") or {}).get("employee_id")),
+            ("DB Name", lambda row: (row.get("database_match") or {}).get("full_name")),
+            ("Message", "message")
+        ],
+        "No avatar verification evidence was returned."
+    )
 
 
 OSINT_TERMINAL_STATUSES = {"COMPLETED", "FAILED"}
+FACE_SEARCH_TERMINAL_STATUSES = {"COMPLETED", "FAILED"}
+DOCUMENT_VALIDATION_TERMINAL_STATUSES = {"COMPLETED", "FAILED"}
 
 
 def normalize_osint_status(status):
@@ -2150,7 +2914,11 @@ def render_osint_job_card(job):
         status_panel("OSINT provider is processing the search in the background.", "neutral")
     elif status == "COMPLETED":
         status_panel("OSINT search completed and the result was stored.", "success")
-        render_osint_results(job.get("results"))
+        render_osint_results(
+            job.get("results"),
+            job.get("normalized")
+        )
+        render_osint_avatar_verification(job)
     elif status == "FAILED":
         status_panel(
             html.escape(job.get("error_message") or "OSINT search failed."),
@@ -2190,21 +2958,314 @@ def render_osint_job_status(job_id):
         st.rerun(scope="app")
 
 
+def render_document_validation_result_payload(result_payload):
+    """Render a completed document-validation result from a background job."""
+
+    result_payload = result_payload or {}
+    decision = result_payload.get("decision", {})
+    extracted_data = result_payload.get("extracted_data", {})
+    database_match = result_payload.get("database_match")
+    face_verification = result_payload.get("face_verification", {})
+    risk_assessment = result_payload.get("risk_assessment", {})
+    manual_review_case = result_payload.get("manual_review_case")
+
+    render_decision(decision, face_verification)
+    render_risk_assessment(risk_assessment)
+
+    if manual_review_case:
+        status_panel(
+            f"Manual review case #{manual_review_case.get('id')} has been created in the review queue.",
+            "warning"
+        )
+
+    uploaded_face_path = face_verification.get("uploaded_face_path")
+    database_face_path = face_verification.get("database_face_path")
+    if uploaded_face_path or database_face_path:
+        render_face_evidence(
+            "Face Extracted From Uploaded Document",
+            uploaded_face_path,
+            "Stored Database Face",
+            database_face_path
+        )
+
+    with st.expander("OCR Raw Text"):
+        st.text(extracted_data.get("raw_text", ""))
+
+    if database_match:
+        render_person(database_match, "Verified Database Record")
+
+
+def render_document_validation_job_card(job):
+    """Render one background document-validation job state and result."""
+
+    job = job or {}
+    status = str(job.get("status") or "PENDING").upper()
+    progress_percent = int(job.get("progress_percent") or 0)
+    progress_message = job.get("progress_message") or "Preparing document validation."
+
+    st.markdown('<div class="section-title">Document Validation</div>', unsafe_allow_html=True)
+    st.progress(
+        min(max(progress_percent, 0), 100),
+        text=f"{min(max(progress_percent, 0), 100)}% - {progress_message}"
+    )
+
+    if status == "PENDING":
+        status_panel("Document validation is queued and waiting to start.", "neutral")
+    elif status == "PROCESSING":
+        status_panel("Document OCR, database verification, and face checks are running.", "neutral")
+    elif status == "COMPLETED":
+        status_panel("Document validation completed and the result was stored.", "success")
+        render_document_validation_result_payload(job.get("result") or {})
+    elif status == "FAILED":
+        status_panel(
+            html.escape(job.get("error_message") or "Document validation failed."),
+            "danger"
+        )
+    else:
+        status_panel(f"Document validation status: {html.escape(status)}", "warning")
+
+    st.caption(
+        f"Job ID: {job.get('job_id')} | "
+        f"Last update: {job.get('updated_at') or '-'}"
+    )
+
+    return status
+
+
+@st.fragment(run_every="10s")
+def render_document_validation_job_status(job_id):
+    """Poll one document-validation job until it reaches a terminal status."""
+
+    response, result = get_request(f"{DOCUMENT_VALIDATION_JOBS_URL}/{job_id}")
+
+    if response is None or response.status_code != 200:
+        status_panel(
+            html.escape(result.get("message", "Document validation job status could not be loaded.")),
+            "danger"
+        )
+        return
+
+    job = result.get("job") or {}
+    st.session_state["active_document_validation_job"] = job
+    status = render_document_validation_job_card(job)
+
+    if status in DOCUMENT_VALIDATION_TERMINAL_STATUSES:
+        st.session_state["last_document_validation_job"] = job
+        st.session_state.pop("active_document_validation_job_id", None)
+        st.session_state.pop("active_document_validation_job", None)
+        st.rerun(scope="app")
+
+def render_face_search_result_payload(result_payload):
+    """Render a completed face-search result using the existing evidence widgets."""
+
+    result_payload = result_payload or {}
+    database_match = result_payload.get("database_match")
+    face_verification = result_payload.get("face_verification", {})
+
+    if result_payload.get("matched") and database_match:
+        status_panel(
+            "Yes, the uploaded face matched a database user. Details are shared below.",
+            "success"
+        )
+    else:
+        status_panel("No confident face match was found in the database.", "danger")
+
+    render_face_evidence(
+        "Uploaded Face Image",
+        face_verification.get("uploaded_face_path"),
+        "Best Database Candidate",
+        face_verification.get("database_face_path")
+    )
+
+    if face_verification.get("error"):
+        st.caption(face_verification.get("error"))
+
+    if database_match:
+        render_person(database_match, "Matched User Details")
+
+
+def render_face_search_job_card(job):
+    """Render the current state of one background face-search job."""
+
+    job = job or {}
+    status = str(job.get("status") or "PENDING").upper()
+    progress_percent = int(job.get("progress_percent") or 0)
+    progress_message = job.get("progress_message") or "Preparing face search."
+
+    st.markdown('<div class="section-title">Face Search</div>', unsafe_allow_html=True)
+    st.progress(
+        min(max(progress_percent, 0), 100),
+        text=f"{min(max(progress_percent, 0), 100)}% - {progress_message}"
+    )
+
+    if status == "PENDING":
+        status_panel("Face search is queued and waiting to start.", "neutral")
+    elif status == "PROCESSING":
+        total_candidates = job.get("total_candidates")
+        message = "Face search is running."
+        if total_candidates:
+            message += f" Comparing against {total_candidates} database photos."
+        status_panel(message, "neutral")
+    elif status == "COMPLETED":
+        render_face_search_result_payload(job.get("result") or {})
+    elif status == "FAILED":
+        status_panel(
+            html.escape(job.get("error_message") or "Face search failed."),
+            "danger"
+        )
+    else:
+        status_panel(f"Face search status: {html.escape(status)}", "warning")
+
+    st.caption(
+        f"Job ID: {job.get('job_id')} | "
+        f"Last update: {job.get('updated_at') or '-'}"
+    )
+
+    return status
+
+
+@st.fragment(run_every="10s")
+def render_face_search_job_status(job_id):
+    """Poll one face-search job until it reaches a terminal status."""
+
+    response, result = get_request(f"{FACE_SEARCH_JOBS_URL}/{job_id}")
+
+    if response is None or response.status_code != 200:
+        status_panel(
+            html.escape(result.get("message", "Face search job status could not be loaded.")),
+            "danger"
+        )
+        return
+
+    job = result.get("job") or {}
+    st.session_state["active_face_search_job"] = job
+    status = render_face_search_job_card(job)
+
+    if status in FACE_SEARCH_TERMINAL_STATUSES:
+        st.session_state["last_face_search_job"] = job
+        st.session_state.pop("active_face_search_job_id", None)
+        st.session_state.pop("active_face_search_job", None)
+        st.rerun(scope="app")
+
+
 def render_identity_search_results(search_result):
-    """Render the latest database identity search result stored in session state."""
+    """Render database identity search results as a paginated table."""
 
     search_result = search_result or {}
     results = search_result.get("results") or []
+    total_matches = search_result.get("total_matches", len(results))
 
-    st.metric("Matches Found", search_result.get("total_matches", len(results)))
+    st.metric("Matches Found", total_matches)
 
-    if results:
-        for index, person in enumerate(results, start=1):
-            render_identity_match_reason(person)
-            render_person(person, f"Match {index}")
-            st.divider()
-    else:
+    if not results:
         status_panel("No matching identity record was found.", "warning")
+        return
+
+    page_number_key = "identity_search_page_number"
+    page_size = 5
+    total_pages = max(
+        1,
+        (len(results) + page_size - 1) // page_size
+    )
+    current_page = min(
+        max(
+            1,
+            int(st.session_state.get(page_number_key, 1))
+        ),
+        total_pages
+    )
+    page_options = list(range(1, total_pages + 1))
+
+    if st.session_state.get("identity_search_page_select") not in page_options:
+        st.session_state["identity_search_page_select"] = current_page
+
+    selected_page = st.selectbox(
+        "Page",
+        page_options,
+        index=current_page - 1,
+        key="identity_search_page_select"
+    )
+
+    if selected_page != current_page:
+        st.session_state[page_number_key] = selected_page
+        st.rerun()
+
+    start_index = (current_page - 1) * page_size
+    end_index = start_index + page_size
+    visible_results = results[start_index:end_index]
+
+    st.caption(
+        f"Showing {start_index + 1}-{min(end_index, len(results))} of {len(results)} matching records."
+    )
+    render_light_table(
+        visible_results,
+        [
+            ("Photo", identity_photo_value),
+            ("Employee ID", "employee_id"),
+            ("Full Name", "full_name"),
+            ("DOB", "date_of_birth"),
+            ("Aadhaar", "aadhar_number"),
+            ("PAN", "pan_number"),
+            ("Voter ID", "voter_id_number"),
+            ("Driving Licence", "driving_license_number"),
+            ("Passport", "passport_number"),
+            ("Phone", "phone_number"),
+            ("Email", "email"),
+            ("Department", "department"),
+            ("State", "state"),
+            ("Matched Fields", identity_match_reason_text)
+        ],
+        "No matching identity record was found.",
+        table_class="admin-table identity-results-table"
+    )
+
+
+def identity_photo_value(person):
+    """Return a large non-cropped identity photo value for table rendering."""
+
+    if not isinstance(person, dict):
+        return None
+
+    photo_path = person.get("photo_path")
+
+    if not local_image_path_exists(photo_path):
+        return None
+
+    return {
+        "image_path": photo_path,
+        "image_url": None,
+        "image_size": 190,
+        "image_fit": "contain"
+    }
+
+
+def identity_match_reason_text(person):
+    """Return compact text explaining why an identity row matched."""
+
+    matched_fields = person.get("_matched_fields") or []
+
+    if not matched_fields:
+        return "Matched submitted fields"
+
+    lines = []
+
+    for match in matched_fields:
+        searched_field = DB_FIELD_LABELS.get(
+            match.get("searched_field"),
+            str(match.get("searched_field") or "-").replace("_", " ").title()
+        )
+        matched_column = DB_FIELD_LABELS.get(
+            match.get("matched_column"),
+            str(match.get("matched_column") or "-").replace("_", " ").title()
+        )
+        searched_value = str(match.get("searched_value") or "-")
+        matched_value = str(match.get("matched_value") or "-")
+
+        lines.append(
+            f"{searched_field}: {searched_value} -> {matched_column}: {matched_value}"
+        )
+
+    return "\n".join(lines)
 
 
 def render_identity_match_reason(person):
@@ -2314,7 +3375,7 @@ def validate_identity_search_rows(search_rows):
 
 
 def build_osint_approval_items(criteria):
-    """Build editable OSINT preview items from eligible search criteria."""
+    """Build editable OSINT preview items from every filled search criterion."""
 
     items = []
     seen_values = set()
@@ -2453,7 +3514,7 @@ def render_osint_job_lookup_panel():
     with action_col:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         load_job_clicked = st.button(
-            "Load Job",
+            "View Job",
             use_container_width=True
         )
 
@@ -2507,12 +3568,12 @@ def news_excerpt(value, max_length=320):
 
 
 def render_news_entities(entities, limit=14):
-    """Render cluster entities as compact chips."""
+    """Render news entities as compact chips."""
 
     entities = entities or []
 
     if not entities:
-        st.caption("No extracted entities available for this cluster.")
+        st.caption("No extracted entities available for this news item.")
         return
 
     chips = []
@@ -2537,7 +3598,7 @@ def render_news_source_cards(sources):
     sources = sources or []
 
     if not sources:
-        st.caption("No source records found for this cluster.")
+        st.caption("No source records found for this news item.")
         return
 
     items = []
@@ -2558,10 +3619,10 @@ def render_news_source_cards(sources):
 
 
 def render_news_cluster_button(cluster, key_prefix):
-    """Render one selectable cluster card and store selection when clicked."""
+    """Render one selectable news card and store selection when clicked."""
 
     cluster_id = cluster.get("cluster_id")
-    title = cluster.get("cluster_name") or f"Cluster {cluster_id}"
+    title = cluster.get("cluster_name") or f"News {cluster_id}"
     article_count = cluster.get("actual_article_count") or cluster.get("article_count") or 0
     top_source = cluster.get("top_source") or "Mixed sources"
     updated_at = format_news_date(cluster.get("updated_at"))
@@ -2587,7 +3648,7 @@ def render_news_cluster_button(cluster, key_prefix):
         '<div class="news-card">',
         f'<div class="news-card-title">{html.escape(str(title))}</div>',
         '<div class="news-card-meta">',
-        f"Cluster {cluster_id} - {article_count} articles - {html.escape(str(top_source))}",
+        f"News {cluster_id} - {article_count} articles - {html.escape(str(top_source))}",
         "</div>",
         '<div class="news-card-meta">',
         f"Updated: {updated_at}{entity_html}",
@@ -2599,7 +3660,7 @@ def render_news_cluster_button(cluster, key_prefix):
     st.markdown(card_html, unsafe_allow_html=True)
 
     if st.button(
-        "Open Cluster",
+        "Open News",
         key=f"{key_prefix}_{cluster_id}",
         use_container_width=True
     ):
@@ -2608,17 +3669,17 @@ def render_news_cluster_button(cluster, key_prefix):
 
 
 def render_news_cluster_detail(cluster):
-    """Render the selected cluster summary, sources, entities, and articles."""
+    """Render the selected news summary, sources, entities, and articles."""
 
     if not cluster:
-        status_panel("Select a cluster to view its intelligence summary.", "neutral")
+        status_panel("Select a news item to view its intelligence summary.", "neutral")
         return
 
     brief_html = "".join([
         '<div class="news-brief">',
-        f'<div class="news-brief-title">{html.escape(str(cluster.get("cluster_name") or "Untitled Cluster"))}</div>',
+        f'<div class="news-brief-title">{html.escape(str(cluster.get("cluster_name") or "Untitled News"))}</div>',
         '<div class="news-brief-subtitle">',
-        f'Cluster ID: {cluster.get("cluster_id") or "-"} | Updated: {format_news_date(cluster.get("updated_at"))}',
+        f'News ID: {cluster.get("cluster_id") or "-"} | Updated: {format_news_date(cluster.get("updated_at"))}',
         "</div>",
         '<div class="news-stat-grid">',
         '<div class="news-stat"><div class="news-stat-label">Articles</div>',
@@ -2649,7 +3710,7 @@ def render_news_cluster_detail(cluster):
     articles = cluster.get("articles") or []
 
     if not articles:
-        status_panel("No articles are linked with this cluster.", "warning")
+        status_panel("No articles are linked with this news item.", "warning")
         return
 
     for index, article in enumerate(articles, 1):
@@ -2684,7 +3745,7 @@ def load_news_cluster_detail(cluster_id):
     )
 
     if response is None or response.status_code != 200:
-        status_panel(result.get("message", "Cluster detail could not be loaded."), "danger")
+        status_panel(result.get("message", "News detail could not be loaded."), "danger")
         return None
 
     return result.get("cluster")
@@ -2705,6 +3766,39 @@ def load_common_news_topics(limit=500):
         return []
 
     return result.get("topics") or []
+
+
+def filter_news_topic_suggestions(topics, query, limit=10):
+    """Return topic suggestions that match what the user has typed."""
+
+    query_text = str(query or "").strip().lower()
+
+    if not query_text:
+        return (topics or [])[:limit]
+
+    starts_with_matches = []
+    contains_matches = []
+    seen_topics = set()
+
+    for topic in topics or []:
+        topic_name = str(topic.get("topic") or "").strip()
+
+        if not topic_name:
+            continue
+
+        topic_key = topic_name.lower()
+
+        if topic_key in seen_topics:
+            continue
+
+        seen_topics.add(topic_key)
+
+        if topic_key.startswith(query_text):
+            starts_with_matches.append(topic)
+        elif query_text in topic_key:
+            contains_matches.append(topic)
+
+    return (starts_with_matches + contains_matches)[:limit]
 
 
 def execute_news_search(query_text):
@@ -2735,21 +3829,15 @@ def execute_news_search(query_text):
     if clusters:
         st.session_state["selected_news_cluster_id"] = clusters[0].get("cluster_id")
         status_panel(
-            f"Found {len(clusters)} matching clusters. The strongest result is opened on the right.",
+            f"Found {len(clusters)} matching news results. The strongest result is opened on the right.",
             "success"
         )
     else:
         st.session_state.pop("selected_news_cluster_id", None)
-        status_panel("No news clusters matched this search.", "warning")
+        status_panel("No news results matched this search.", "warning")
 
 
 render_header()
-
-metric_one, metric_two, metric_three, metric_four = st.columns(4)
-metric_one.metric("Verification Modes", "6")
-metric_two.metric("Document Types", "5")
-metric_three.metric("Database", "PostgreSQL")
-metric_four.metric("Face Engine", "OpenCV")
 
 selected_dashboard_section = render_sidebar_navigation()
 render_active_section_header(selected_dashboard_section)
@@ -2886,11 +3974,13 @@ if selected_dashboard_section == "Identity Search":
                     "total_matches": result.get("total_matches", 0),
                     "results": result.get("results", [])
                 }
+                st.session_state["identity_search_page_number"] = 1
+                st.session_state["identity_search_page_select"] = 1
                 st.session_state["pending_osint_items"] = build_osint_approval_items(criteria)
 
                 if not st.session_state["pending_osint_items"]:
                     status_panel(
-                        "No OSINT eligible fields were provided. Add Username, Email, Phone Number, or Full Name to send OSINT.",
+                        "No filled search fields were available to send to OSINT.",
                         "warning"
                     )
 
@@ -2913,7 +4003,7 @@ if selected_dashboard_section == "News Intelligence":
         <div class="news-brief">
             <div class="news-brief-title">News Intelligence</div>
             <div class="news-brief-subtitle">
-                Explore top clusters, search by topic/source/entity, and open each cluster to review
+                Explore top news, search by topic/source/entity, and open each news item to review
                 its summary, source spread, key entities, and related articles.
             </div>
         </div>
@@ -2921,13 +4011,27 @@ if selected_dashboard_section == "News Intelligence":
         unsafe_allow_html=True
     )
 
-    pending_topic_query = st.session_state.pop("news_topic_pending_query", None)
+    if st.session_state.pop("news_intelligence_reset_requested", False):
+        st.session_state["news_search_query"] = ""
+        st.session_state["news_keyword_select"] = "Select keyword"
+        st.session_state.pop("news_search_result", None)
+        st.session_state.pop("selected_news_cluster_id", None)
+        st.session_state.pop("news_search_pending_text", None)
+        st.session_state.pop("news_topic_pending_query", None)
+        st.session_state.pop("news_topic_should_search", None)
+
+    pending_topic_query = (
+        st.session_state.pop("news_topic_pending_query", None)
+        or st.session_state.pop("news_search_pending_text", None)
+    )
 
     if pending_topic_query:
         st.session_state["news_search_query"] = pending_topic_query
-        st.session_state["news_topic_should_search"] = pending_topic_query
+        st.session_state["news_keyword_select"] = "Select keyword"
 
-    news_search_col, news_action_col, news_clear_col = st.columns([3, 0.95, 0.95])
+    st.session_state.pop("news_topic_should_search", None)
+
+    news_search_col, news_keyword_col, news_action_col, news_clear_col = st.columns([2.2, 1.35, 0.85, 0.85])
 
     with news_search_col:
         news_query = st.text_input(
@@ -2935,6 +4039,44 @@ if selected_dashboard_section == "News Intelligence":
             placeholder="Example: drone, Pakistan, Delhi, BSF, Twitter/X",
             key="news_search_query"
         )
+
+    with news_keyword_col:
+        common_topics = st.session_state.get("news_common_topics_cache")
+
+        if common_topics is None:
+            with st.spinner("Loading searchable keywords..."):
+                common_topics = load_common_news_topics(500)
+            st.session_state["news_common_topics_cache"] = common_topics
+
+        topic_suggestions = filter_news_topic_suggestions(
+            common_topics,
+            news_query,
+            limit=25
+        )
+        suggestion_options = [
+            str(topic.get("topic") or "").strip()
+            for topic in topic_suggestions
+            if str(topic.get("topic") or "").strip()
+        ]
+        suggestion_options = list(dict.fromkeys(suggestion_options))[:25]
+        keyword_options = ["Select keyword"] + suggestion_options
+
+        if st.session_state.get("news_keyword_select") not in keyword_options:
+            st.session_state["news_keyword_select"] = "Select keyword"
+
+        selected_keyword = st.selectbox(
+            "Relevant keywords",
+            keyword_options,
+            index=0,
+            key="news_keyword_select"
+        )
+
+        if (
+            selected_keyword != "Select keyword"
+            and selected_keyword != str(news_query or "").strip()
+        ):
+            st.session_state["news_search_pending_text"] = selected_keyword
+            st.rerun()
 
     with news_action_col:
         st.markdown('<div class="news-search-action-spacer"></div>', unsafe_allow_html=True)
@@ -2946,24 +4088,19 @@ if selected_dashboard_section == "News Intelligence":
 
     with news_clear_col:
         st.markdown('<div class="news-search-action-spacer"></div>', unsafe_allow_html=True)
-        clear_news_search = st.button(
-            "Clear",
+        reset_news_search = st.button(
+            "Reset",
             use_container_width=True
         )
 
-    if clear_news_search:
-        st.session_state.pop("news_search_result", None)
-        st.session_state.pop("selected_news_cluster_id", None)
+    if reset_news_search:
+        st.session_state["news_intelligence_reset_requested"] = True
         st.rerun()
 
-    topic_search_query = st.session_state.pop("news_topic_should_search", None)
-
-    if topic_search_query:
-        execute_news_search(topic_search_query)
-    elif news_search_clicked:
+    if news_search_clicked:
         execute_news_search(news_query)
 
-    with st.spinner("Loading top clusters..."):
+    with st.spinner("Loading top news..."):
         top_response, top_result = get_request(
             NEWS_TOP_CLUSTERS_URL,
             params={
@@ -2974,7 +4111,7 @@ if selected_dashboard_section == "News Intelligence":
     top_clusters = []
 
     if top_response is None or top_response.status_code != 200:
-        status_panel(top_result.get("message", "Top news clusters could not be loaded."), "danger")
+        status_panel(top_result.get("message", "Top news could not be loaded."), "danger")
     else:
         top_clusters = top_result.get("clusters") or []
 
@@ -2999,10 +4136,10 @@ if selected_dashboard_section == "News Intelligence":
                     "search_news_cluster"
                 )
 
-        st.markdown('<div class="section-title">Top 10 Clusters</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Top 10 News</div>', unsafe_allow_html=True)
 
         if not top_clusters:
-            status_panel("No clusters were found in the news database.", "warning")
+            status_panel("No news records were found in the news database.", "warning")
         else:
             for cluster in top_clusters:
                 render_news_cluster_button(
@@ -3011,47 +4148,6 @@ if selected_dashboard_section == "News Intelligence":
                 )
 
     with cluster_detail_col:
-        st.markdown('<div class="section-title">Common Topics</div>', unsafe_allow_html=True)
-        topic_limit = st.selectbox(
-            "Keywords to display",
-            [5, 10, 30, 50],
-            index=1,
-            key="news_common_topic_limit"
-        )
-
-        with st.spinner("Loading common topics..."):
-            common_topics = load_common_news_topics(topic_limit)
-
-        selected_topic_query = None
-
-        if not common_topics:
-            status_panel("No common topics were found in the news database.", "warning")
-        else:
-            st.caption(
-                f"Showing top {len(common_topics)} searchable keywords from cluster and article entity data."
-            )
-            topic_columns = st.columns(2)
-
-            for topic_index, topic in enumerate(common_topics):
-                topic_name = str(topic.get("topic") or "").strip()
-
-                if not topic_name:
-                    continue
-
-                topic_label = topic_name if len(topic_name) <= 32 else f"{topic_name[:29]}..."
-
-                with topic_columns[topic_index % len(topic_columns)]:
-                    if st.button(
-                        topic_label,
-                        key=f"news_common_topic_{topic_limit}_{topic_index}_{topic.get('topic_key')}",
-                        use_container_width=True
-                    ):
-                        selected_topic_query = topic_name
-
-        if selected_topic_query:
-            st.session_state["news_topic_pending_query"] = selected_topic_query
-            st.rerun()
-
         selected_cluster_id = st.session_state.get("selected_news_cluster_id")
         selected_cluster = load_news_cluster_detail(selected_cluster_id)
         render_news_cluster_detail(selected_cluster)
@@ -3085,79 +4181,64 @@ if selected_dashboard_section == "Document Validation":
 
     with preview_col:
         st.markdown('<div class="section-title">Upload Preview</div>', unsafe_allow_html=True)
-        if uploaded_document is not None:
-            st.image(uploaded_document, width=260)
-        else:
-            status_panel("Awaiting document image.", "neutral")
+        document_preview_job = (
+            st.session_state.get("active_document_validation_job")
+            or st.session_state.get("last_document_validation_job")
+            or {}
+        )
+        render_persistent_upload_preview(
+            uploaded_document,
+            document_preview_job.get("uploaded_document_path"),
+            "Awaiting document image.",
+            260
+        )
 
     if validate_clicked:
         if uploaded_document is None:
             status_panel("Please upload a document image.", "danger")
         else:
             progress_bar = st.progress(
-                5,
+                10,
                 text="Preparing uploaded document..."
             )
             progress_bar.progress(
-                20,
-                text="Checking selected document type..."
+                50,
+                text="Queueing background document validation..."
             )
             response, result = post_request(
-                VALIDATE_ID_URL,
+                DOCUMENT_VALIDATION_JOBS_URL,
                 data={
                     "document_type": document_type,
                     manual_document_field: manual_document_number
                 },
-                files=uploaded_file_payload("document", uploaded_document)
+                files=uploaded_file_payload("document", uploaded_document),
+                timeout=120
+            )
+            progress_bar.progress(
+                100,
+                text="Background document validation request submitted."
             )
 
             if response is None or response.status_code != 200:
-                progress_bar.progress(
-                    100,
-                    text="Validation stopped."
-                )
                 status_panel(result.get("message", "Document validation failed."), "danger")
             else:
-                progress_bar.progress(
-                    70,
-                    text="Reading OCR and matching database record..."
-                )
-                decision = result.get("decision", {})
-                extracted_data = result.get("extracted_data", {})
-                database_match = result.get("database_match")
-                face_verification = result.get("face_verification", {})
-                risk_assessment = result.get("risk_assessment", {})
-                manual_review_case = result.get("manual_review_case")
-                progress_bar.progress(
-                    100,
-                    text="Verification completed."
+                document_job = result.get("job") or {}
+                st.session_state["active_document_validation_job_id"] = document_job.get("job_id")
+                st.session_state["active_document_validation_job"] = document_job
+                st.session_state.pop("last_document_validation_job", None)
+                status_panel(
+                    f"Document validation queued successfully. Job ID: {document_job.get('job_id')}",
+                    "success"
                 )
 
-                render_decision(decision, face_verification)
-                render_risk_assessment(risk_assessment)
-
-                if manual_review_case:
-                    status_panel(
-                        f"Manual review case #{manual_review_case.get('id')} has been created in the review queue.",
-                        "warning"
-                    )
-
-                uploaded_face_path = face_verification.get("uploaded_face_path")
-                database_face_path = face_verification.get("database_face_path")
-                if uploaded_face_path or database_face_path:
-                    render_face_evidence(
-                        "Face Extracted From Uploaded Document",
-                        uploaded_face_path,
-                        "Stored Database Face",
-                        database_face_path
-                    )
-
-                with st.expander("OCR Raw Text"):
-                    st.text(extracted_data.get("raw_text", ""))
-
-                if database_match:
-                    render_person(database_match, "Verified Database Record")
-
+    if st.session_state.get("active_document_validation_job_id"):
+        render_document_validation_job_status(
+            st.session_state.get("active_document_validation_job_id")
+        )
+    elif st.session_state.get("last_document_validation_job"):
+        render_document_validation_job_card(
+            st.session_state.get("last_document_validation_job")
+        )
 
 if selected_dashboard_section == "Face Search":
     st.markdown('<div class="section-title">Find A User By Face Image</div>', unsafe_allow_html=True)
@@ -3181,10 +4262,17 @@ if selected_dashboard_section == "Face Search":
 
     with preview_col:
         st.markdown('<div class="section-title">Face Preview</div>', unsafe_allow_html=True)
-        if uploaded_face_image is not None:
-            st.image(uploaded_face_image, width=240)
-        else:
-            status_panel("Awaiting face image.", "neutral")
+        face_preview_job = (
+            st.session_state.get("active_face_search_job")
+            or st.session_state.get("last_face_search_job")
+            or {}
+        )
+        render_persistent_upload_preview(
+            uploaded_face_image,
+            face_preview_job.get("uploaded_image_path"),
+            "Awaiting face image.",
+            240
+        )
 
     if face_search_clicked:
         if uploaded_face_image is None:
@@ -3195,48 +4283,42 @@ if selected_dashboard_section == "Face Search":
                 text="Preparing uploaded face image..."
             )
             face_progress.progress(
-                35,
-                text="Searching database face records..."
+                50,
+                text="Queueing background face search..."
             )
-
-            with st.spinner("Matching face. Please wait..."):
-                response, result = post_request(
-                    FACE_SEARCH_URL,
-                    files=uploaded_file_payload("image", uploaded_face_image),
-                    timeout=900
-                )
-
+            response, result = post_request(
+                FACE_SEARCH_JOBS_URL,
+                files=uploaded_file_payload("image", uploaded_face_image),
+                timeout=120
+            )
             face_progress.progress(
                 100,
-                text="Face search completed."
+                text="Background face search request submitted."
             )
 
             if response is None or response.status_code != 200:
                 status_panel(result.get("message", "Face search failed."), "danger")
             else:
-                database_match = result.get("database_match")
-                face_verification = result.get("face_verification", {})
-
-                if result.get("matched") and database_match:
-                    status_panel("Yes, the uploaded face matched a database user. Details are shared below.", "success")
-                else:
-                    status_panel("No confident face match was found in the database.", "danger")
-
-                render_face_evidence(
-                    "Uploaded Face Image",
-                    face_verification.get("uploaded_face_path"),
-                    "Best Database Candidate",
-                    face_verification.get("database_face_path")
+                face_job = result.get("job") or {}
+                st.session_state["active_face_search_job_id"] = face_job.get("job_id")
+                st.session_state["active_face_search_job"] = face_job
+                st.session_state.pop("last_face_search_job", None)
+                status_panel(
+                    f"Face search queued successfully. Job ID: {face_job.get('job_id')}",
+                    "success"
                 )
 
-                if face_verification.get("error"):
-                    st.caption(face_verification.get("error"))
+    if st.session_state.get("active_face_search_job_id"):
+        render_face_search_job_status(
+            st.session_state.get("active_face_search_job_id")
+        )
+    elif st.session_state.get("last_face_search_job"):
+        render_face_search_job_card(
+            st.session_state.get("last_face_search_job")
+        )
 
-                if database_match:
-                    render_person(database_match, "Matched User Details")
 
-
-if selected_dashboard_section == "Manual Review":
+if selected_dashboard_section == "Document Validation":
     st.markdown('<div class="section-title">Manual Review Queue</div>', unsafe_allow_html=True)
 
     if st.session_state.get("manual_review_success_message"):
@@ -3672,79 +4754,3 @@ if selected_dashboard_section == "Admin Operations":
                 else:
                     status_panel(result.get("message", "Identity deleted successfully."), "success")
                     st.rerun()
-
-
-if selected_dashboard_section == "Register Identity":
-    st.markdown('<div class="section-title">Register A New Identity</div>', unsafe_allow_html=True)
-
-    with st.form("register_identity_form", clear_on_submit=False):
-        identity_col, document_col, photo_col = st.columns([1.15, 1.15, 0.9], gap="large")
-
-        with identity_col:
-            st.markdown("**Core Identity**")
-            employee_id = st.text_input("Employee ID")
-            full_name = st.text_input("Full Name")
-            date_of_birth = st.text_input("Date of Birth", placeholder="YYYY-MM-DD")
-            phone_number = st.text_input("Phone Number")
-            email = st.text_input("Email")
-            department = st.text_input("Department")
-            state = st.text_input("State")
-
-        with document_col:
-            st.markdown("**Document Numbers**")
-            aadhar_number = st.text_input("Aadhaar Number")
-            pan_number = st.text_input("PAN Number")
-            voter_id_number = st.text_input("Voter ID Number")
-            driving_license_number = st.text_input("Driving Licence Number")
-            passport_number = st.text_input("Passport Number")
-
-        with photo_col:
-            st.markdown("**Profile Photo**")
-            profile_photo = st.file_uploader(
-                "Upload user photo",
-                type=["jpg", "jpeg", "png"],
-                key="register_profile_photo"
-            )
-            if profile_photo is not None:
-                st.image(profile_photo, width=210)
-
-        submitted = st.form_submit_button(
-            "Submit Identity",
-            use_container_width=True
-        )
-
-    if submitted:
-        if not employee_id.strip():
-            status_panel("Employee ID is required.", "danger")
-        elif not full_name.strip():
-            status_panel("Full name is required.", "danger")
-        elif profile_photo is None:
-            status_panel("Please upload a user photo.", "danger")
-        else:
-            with st.spinner("Saving identity details and profile photo..."):
-                response, result = post_request(
-                    REGISTER_IDENTITY_URL,
-                    data={
-                        "employee_id": employee_id,
-                        "full_name": full_name,
-                        "date_of_birth": date_of_birth,
-                        "aadhar_number": aadhar_number,
-                        "pan_number": pan_number,
-                        "voter_id_number": voter_id_number,
-                        "driving_license_number": driving_license_number,
-                        "passport_number": passport_number,
-                        "phone_number": phone_number,
-                        "email": email,
-                        "department": department,
-                        "state": state
-                    },
-                    files=uploaded_file_payload("photo", profile_photo)
-                )
-
-            if response is None or response.status_code != 200:
-                status_panel(result.get("message", "Identity registration failed."), "danger")
-            else:
-                status_panel(result.get("message", "Identity registered successfully."), "success")
-                registered_user = result.get("user")
-                if registered_user:
-                    render_person(registered_user, "Registered User Details")
