@@ -1,6 +1,7 @@
 """OpenCV-based face comparison used by document and face search flows."""
 
 import os
+import threading
 from urllib.parse import urljoin
 
 import cv2
@@ -41,6 +42,7 @@ class FaceVerificationService:
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        self._cascade_lock = threading.Lock()
 
     def compare_faces(
         self,
@@ -590,18 +592,35 @@ class FaceVerificationService:
     def _extract_face(self, image):
         """Find the largest detected face and return a padded crop."""
 
+        if image is None or image.size == 0:
+
+            return None
+
+        if self.face_cascade.empty():
+
+            return None
+
         gray_image = cv2.cvtColor(
             image,
             cv2.COLOR_BGR2GRAY
         )
         gray_image = cv2.equalizeHist(gray_image)
-
-        faces = self.face_cascade.detectMultiScale(
+        gray_image = np.ascontiguousarray(
             gray_image,
-            scaleFactor=1.05,
-            minNeighbors=4,
-            minSize=(40, 40)
+            dtype=np.uint8
         )
+
+        try:
+            with self._cascade_lock:
+                faces = self.face_cascade.detectMultiScale(
+                    gray_image,
+                    scaleFactor=1.05,
+                    minNeighbors=4,
+                    minSize=(40, 40)
+                )
+        except cv2.error:
+
+            return None
 
         if len(faces) == 0:
 

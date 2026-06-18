@@ -7,10 +7,15 @@ tasks while the final OSINT payload returns through the webhook endpoint.
 """
 
 import hmac
+import io
 import json
+import os
 import re
+from uuid import uuid4
 
 import requests
+from PIL import Image
+from PIL import UnidentifiedImageError
 from fastapi import BackgroundTasks
 from fastapi import FastAPI
 from fastapi import Form
@@ -29,6 +34,7 @@ try:
     from ..services.file_service import FileService
     from ..services.face_service import FaceVerificationService
     from ..services.ocr_service import OCRService
+    from ..services.osint_normalizer_service import OSINTNormalizerService
     from ..services.osint_service import OSINTService
     from ..services.risk_service import RiskScoringService
 except ImportError:
@@ -39,6 +45,7 @@ except ImportError:
     from services.file_service import FileService
     from services.face_service import FaceVerificationService
     from services.ocr_service import OCRService
+    from services.osint_normalizer_service import OSINTNormalizerService
     from services.osint_service import OSINTService
     from services.risk_service import RiskScoringService
 
@@ -55,6 +62,7 @@ decision_service = DecisionService()
 file_service = FileService()
 face_service = FaceVerificationService()
 ocr_service = OCRService()
+osint_normalizer_service = OSINTNormalizerService()
 osint_service = OSINTService()
 risk_service = RiskScoringService()
 document_verification_service = DocumentVerificationService(
@@ -139,15 +147,27 @@ def osint_health_payload(check_network=False):
 
 """Helper functions for validating and normalizing identity search criteria and OSINT targets."""
 
-def osint_targets_from_criteria(criteria):
-    """Extract OSINT-safe structured targets from advanced search criteria."""
+OSINT_ALLOWED_TARGET_FIELDS = {
+    "full_name",
+    "username",
+    "date_of_birth",
+    "aadhar_number",
+    "pan_number",
+    "voter_id_number",
+    "driving_license_number",
+    "passport_number",
+    "phone",
+    "phone_number",
+    "email",
+    "employee_id",
+    "department",
+    "state"
+}
 
-    allowed_fields = {
-        "full_name",
-        "email",
-        "phone",
-        "phone_number"
-    }
+
+def osint_targets_from_criteria(criteria):
+    """Extract structured OSINT targets from every filled search criterion."""
+
     targets = []
 
     for item in criteria or []:
@@ -161,7 +181,7 @@ def osint_targets_from_criteria(criteria):
             "value": value
         }
 
-        if field in allowed_fields and value and target not in targets:
+        if field in OSINT_ALLOWED_TARGET_FIELDS and value and target not in targets:
 
             targets.append(target)
 
@@ -216,13 +236,6 @@ def validate_identity_search_value(
 def normalize_osint_items(items):
     """Validate approved OSINT items and return provider key/value targets."""
 
-    allowed_fields = {
-        "full_name",
-        "username",
-        "email",
-        "phone",
-        "phone_number"
-    }
     targets = []
 
     for item in items or []:
@@ -237,7 +250,7 @@ def normalize_osint_items(items):
             field = str(item.get("field") or "").strip()
             value = str(item.get("value") or "").strip()
 
-        if field not in allowed_fields:
+        if field not in OSINT_ALLOWED_TARGET_FIELDS:
 
             raise ValueError(f"Unsupported OSINT field: {field or '-'}")
 
@@ -314,6 +327,109 @@ def extract_osint_webhook_target_values(payload):
     return values
 
 
+def ensure_osint_job_normalized(
+    job_id,
+    job,
+    request_database_service
+):
+    """Return normalized OSINT rows, creating them from raw results when missing."""
+
+    normalized_data = request_database_service.get_normalized_osint_data(job_id)
+
+    if (
+        (normalized_data.get("profiles") or normalized_data.get("matches"))
+        or not job
+        or not job.get("results")
+    ):
+        return normalized_data
+
+    try:
+        logger.info(
+            "OSINT normalized data missing, rebuilding from stored result: job_id=%s",
+            job_id
+        )
+        osint_normalizer_service.normalize_and_store(
+            job_id,
+            {
+                "job_id": job_id,
+                "status": job.get("status"),
+                "results": job.get("results")
+            },
+            request_database_service
+        )
+        normalized_data = request_database_service.get_normalized_osint_data(job_id)
+        logger.info(
+            "OSINT normalized data rebuilt: job_id=%s profiles=%s matches=%s contacts=%s",
+            job_id,
+            len(normalized_data.get("profiles") or []),
+            len(normalized_data.get("matches") or []),
+            len(normalized_data.get("contacts") or [])
+        )
+
+    except Exception:
+        logger.exception(
+            "OSINT lazy normalization failed: job_id=%s",
+            job_id
+        )
+
+    return normalized_data
+
+
+def osint_avatar_candidates_from_normalized(normalized_data):
+    """Collect every normalized OSINT row that can provide an avatar image."""
+
+    candidates = []
+    seen = set()
+
+    for section_key in ("profiles", "matches"):
+        for row in normalized_data.get(section_key) or []:
+            if not row.get("avatar_path") and not row.get("avatar_url"):
+                continue
+
+            candidate = dict(row)
+
+            if not candidate.get("profile_url") and candidate.get("url"):
+                candidate["profile_url"] = candidate.get("url")
+
+            if not candidate.get("source"):
+                candidate["source"] = (
+                    "Social Profile"
+                    if section_key == "profiles"
+                    else "Enriched Match"
+                )
+
+            profile_identity = str(
+                candidate.get("profile_url")
+                or candidate.get("url")
+                or ""
+            ).strip().lower().rstrip("/")
+            avatar_identity = str(
+                candidate.get("avatar_url")
+                or candidate.get("avatar_path")
+                or ""
+            ).strip().lower()
+
+            if profile_identity:
+                fingerprint = ("profile_url", profile_identity)
+            elif avatar_identity:
+                fingerprint = ("avatar", avatar_identity)
+            else:
+                fingerprint = (
+                    "metadata",
+                    str(candidate.get("platform") or "").strip().lower(),
+                    str(candidate.get("target") or "").strip().lower(),
+                    str(candidate.get("bio") or candidate.get("extracted_text") or "").strip().lower()
+                )
+
+            if fingerprint in seen:
+                continue
+
+            seen.add(fingerprint)
+            candidates.append(candidate)
+
+    return candidates
+
+
 def submit_osint_job_background(
     job_id,
     targets
@@ -343,6 +459,154 @@ def submit_osint_job_background(
             job_id
         )
 
+
+def run_face_search_job_background(
+    job_id,
+    uploaded_image_path
+):
+    """Execute one face-search job in the background using a fresh DB connection."""
+
+    logger.info(
+        "Face search background task started: job_id=%s uploaded_image_path=%s",
+        job_id,
+        uploaded_image_path
+    )
+    background_database_service = DatabaseService()
+
+    try:
+
+        database_people = background_database_service.get_identities_with_photos()
+        logger.info(
+            "Face search background candidates loaded: job_id=%s total_candidates=%s",
+            job_id,
+            len(database_people)
+        )
+        background_database_service.mark_face_search_job_processing(
+            job_id,
+            len(database_people)
+        )
+        background_database_service.update_face_search_job_progress(
+            job_id,
+            50,
+            "Face comparison is running. This can take a few minutes."
+        )
+        face_search_result = face_service.find_best_database_match(
+            uploaded_image_path,
+            database_people
+        )
+        payload = {
+            "status": "success",
+            "total_candidates": len(database_people),
+            "matched": face_search_result.get("matched"),
+            "best_score": face_search_result.get("best_score"),
+            "database_match": face_search_result.get("best_match"),
+            "face_verification": face_search_result.get("face_verification"),
+            "top_candidates": face_search_result.get("top_candidates", [])
+        }
+        background_database_service.complete_face_search_job(
+            job_id,
+            payload,
+            len(database_people)
+        )
+        logger.info(
+            "Face search background task completed: job_id=%s matched=%s best_score=%s employee_id=%s",
+            job_id,
+            payload.get("matched"),
+            payload.get("best_score"),
+            (payload.get("database_match") or {}).get("employee_id")
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Face search background task failed: job_id=%s",
+            job_id
+        )
+        background_database_service.mark_face_search_job_failed(
+            job_id,
+            str(error)
+        )
+
+    finally:
+
+        background_database_service.close()
+        logger.info(
+            "Face search background task finished: job_id=%s",
+            job_id
+        )
+
+
+
+def run_document_validation_job_background(
+    job_id,
+    document_type,
+    uploaded_document_path,
+    original_filename,
+    manual_values
+):
+    """Execute one document-validation job in the background with a fresh DB connection."""
+
+    logger.info(
+        "Document validation background task started: job_id=%s document_type=%s path=%s",
+        job_id,
+        document_type,
+        uploaded_document_path
+    )
+    background_database_service = DatabaseService()
+    background_document_service = DocumentVerificationService(
+        file_service,
+        ocr_service,
+        background_database_service,
+        face_service,
+        risk_service,
+        decision_service
+    )
+
+    try:
+
+        background_database_service.mark_document_validation_job_processing(job_id)
+        result = background_document_service.verify_saved_file(
+            document_type=document_type,
+            saved_file_path=uploaded_document_path,
+            original_filename=original_filename,
+            manual_values=manual_values,
+            progress_callback=lambda percent, message: (
+                background_database_service.update_document_validation_job_progress(
+                    job_id,
+                    percent,
+                    message
+                )
+            )
+        )
+        background_database_service.complete_document_validation_job(
+            job_id,
+            result
+        )
+        logger.info(
+            "Document validation background task completed: job_id=%s decision=%s employee_id=%s",
+            job_id,
+            (result.get("decision") or {}).get("status"),
+            (result.get("database_match") or {}).get("employee_id")
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Document validation background task failed: job_id=%s",
+            job_id
+        )
+        background_database_service.mark_document_validation_job_failed(
+            job_id,
+            str(error)
+        )
+
+    finally:
+
+        background_database_service.close()
+        logger.info(
+            "Document validation background task finished: job_id=%s",
+            job_id
+        )
 
 @app.get("/")
 def home():
@@ -718,6 +982,9 @@ async def get_osint_job(
 
     try:
 
+        request_database_service.mark_stale_osint_jobs_failed(
+            settings.OSINT_JOB_STALE_MINUTES
+        )
         job = request_database_service.get_osint_job(job_id)
 
         if not job:
@@ -729,6 +996,12 @@ async def get_osint_job(
                     "message": f"OSINT job not found: {job_id}"
                 }
             )
+
+        job["normalized"] = ensure_osint_job_normalized(
+            job_id,
+            job,
+            request_database_service
+        )
 
         return JSONResponse(
             content={
@@ -751,6 +1024,390 @@ async def get_osint_job(
 
     finally:
 
+        request_database_service.close()
+
+
+@app.post("/api/v1/jobs/face-search")
+async def submit_face_search_job(
+
+    background_tasks: BackgroundTasks,
+
+    image: UploadFile = File(...)
+
+):
+    """Create a background face-search job and return immediately with a job ID."""
+
+    request_database_service = DatabaseService()
+
+    try:
+
+        logger.info(
+            "Face search async job creation requested: filename=%s",
+            image.filename
+        )
+        saved_file_path = file_service.save_upload(image)
+        face_job = request_database_service.create_face_search_job(
+            saved_file_path
+        )
+        job_id = face_job.get("job_id")
+        background_tasks.add_task(
+            run_face_search_job_background,
+            job_id,
+            saved_file_path
+        )
+        logger.info(
+            "Face search async job queued: job_id=%s uploaded_image_path=%s",
+            job_id,
+            saved_file_path
+        )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": "Face search queued successfully",
+                "job": face_job
+            }
+        )
+
+    except ValueError as e:
+
+        logger.exception("Face search async validation failed")
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    except Exception as e:
+
+        logger.exception("Face search async job submission failed")
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+
+        request_database_service.close()
+
+
+@app.get("/api/v1/jobs/face-search/{job_id}")
+async def get_face_search_job(
+
+    job_id: str
+
+):
+    """Return one background face-search job for dashboard polling."""
+
+    request_database_service = DatabaseService()
+
+    try:
+
+        request_database_service.mark_stale_face_search_jobs_failed(
+            settings.FACE_SEARCH_JOB_STALE_MINUTES
+        )
+        job = request_database_service.get_face_search_job(job_id)
+
+        if not job:
+
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": f"Face search job not found: {job_id}"
+                }
+            )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "job": job
+            }
+        )
+
+    except Exception as e:
+
+        logger.exception("Face search job lookup failed: job_id=%s", job_id)
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+
+        request_database_service.close()
+
+
+def resolve_osint_avatar_for_face_check(job_id, profile):
+    """Return a local avatar path, downloading remote URLs when possible."""
+
+    project_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            ".."
+        )
+    )
+    avatar_path = profile.get("avatar_path")
+
+    if avatar_path:
+        candidate_path = avatar_path
+
+        if not os.path.isabs(candidate_path):
+            candidate_path = os.path.join(
+                project_root,
+                avatar_path.replace("/", os.sep)
+            )
+
+        if os.path.exists(candidate_path) and is_valid_osint_avatar_file(candidate_path):
+            return candidate_path, None
+
+    avatar_url = str(profile.get("avatar_url") or "").strip()
+
+    if not avatar_url.startswith(("http://", "https://")):
+        return None, "No decoded avatar image or downloadable avatar URL was available"
+
+    try:
+        response = requests.get(
+            avatar_url,
+            headers={
+                "User-Agent": "identity-search-service/1.0"
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+
+        if "image" not in content_type:
+            return None, f"Avatar URL did not return an image: {content_type or 'unknown content type'}"
+
+        if len(response.content) > 5 * 1024 * 1024:
+            return None, "Avatar image is larger than 5 MB"
+
+        try:
+            extension = avatar_extension_from_bytes(response.content)
+        except ValueError as error:
+            return None, str(error)
+
+        image_dir = os.path.join(
+            project_root,
+            "backend",
+            "uploads",
+            "osint_images"
+        )
+        os.makedirs(
+            image_dir,
+            exist_ok=True
+        )
+        safe_platform = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            str(profile.get("platform") or "platform")
+        ).strip("_")
+        file_name = f"{job_id}_{safe_platform}_avatar_{uuid4().hex[:8]}.{extension}"
+        avatar_file_path = os.path.join(
+            image_dir,
+            file_name
+        )
+
+        with open(avatar_file_path, "wb") as avatar_file:
+            avatar_file.write(response.content)
+
+        return avatar_file_path, None
+
+    except Exception as error:
+        return None, f"Avatar URL could not be downloaded: {error}"
+
+
+def avatar_extension_from_bytes(image_bytes):
+    """Validate downloaded avatar bytes and return a safe extension."""
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.verify()
+            image_format = (image.format or "").upper()
+    except (OSError, UnidentifiedImageError, ValueError) as error:
+        raise ValueError("Avatar bytes are not a renderable image") from error
+
+    extension_map = {
+        "JPEG": "jpg",
+        "JPG": "jpg",
+        "PNG": "png",
+        "WEBP": "webp"
+    }
+    extension = extension_map.get(image_format)
+
+    if not extension:
+        raise ValueError(f"Unsupported avatar image format: {image_format or 'unknown'}")
+
+    return extension
+
+
+def is_valid_osint_avatar_file(image_path):
+    """Return True only when a stored OSINT avatar is a real image file."""
+
+    try:
+        with Image.open(image_path) as image:
+            image.verify()
+            image_format = (image.format or "").upper()
+    except (OSError, UnidentifiedImageError, ValueError):
+        return False
+
+    return image_format in {"JPEG", "JPG", "PNG", "WEBP"}
+
+
+@app.post("/api/v1/osint/jobs/{job_id}/verify-avatars")
+async def verify_osint_avatars(
+
+    job_id: str,
+
+    verification_request: dict = Body(None)
+
+):
+    """Compare normalized OSINT avatar images with registered database photos."""
+
+    request_database_service = DatabaseService()
+
+    try:
+        job = request_database_service.get_osint_job(job_id)
+
+        if not job:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": f"OSINT job not found: {job_id}"
+                }
+            )
+
+        normalized_data = ensure_osint_job_normalized(
+            job_id,
+            job,
+            request_database_service
+        )
+        profiles = osint_avatar_candidates_from_normalized(normalized_data)
+        approved_avatars = (verification_request or {}).get("approved_avatars") or []
+
+        if approved_avatars:
+            profiles = approved_avatars
+
+        database_people = request_database_service.get_identities_with_photos()
+        verification_rows = []
+
+        for profile in profiles:
+            avatar_path, avatar_error = resolve_osint_avatar_for_face_check(
+                job_id,
+                profile
+            )
+
+            if avatar_error:
+                verification_rows.append(
+                    {
+                        "platform": profile.get("platform"),
+                        "target": profile.get("target"),
+                        "profile_url": profile.get("profile_url") or profile.get("url"),
+                        "avatar_url": profile.get("avatar_url"),
+                        "avatar_path": profile.get("avatar_path"),
+                        "matched": False,
+                        "best_score": 0.0,
+                        "database_match": None,
+                        "message": avatar_error
+                    }
+                )
+                continue
+
+            face_result = face_service.find_best_database_match(
+                avatar_path,
+                database_people
+            )
+            verification_rows.append(
+                {
+                    "platform": profile.get("platform"),
+                    "target": profile.get("target"),
+                    "profile_url": profile.get("profile_url") or profile.get("url"),
+                    "avatar_url": profile.get("avatar_url"),
+                    "avatar_path": profile.get("avatar_path") or avatar_path,
+                    "matched": face_result.get("matched"),
+                    "best_score": face_result.get("best_score"),
+                    "score_gap": face_result.get("score_gap"),
+                    "database_match": face_result.get("best_match"),
+                    "face_verification": face_result.get("face_verification"),
+                    "message": (
+                        "Face matched with database identity"
+                        if face_result.get("matched")
+                        else (face_result.get("face_verification") or {}).get("error")
+                    )
+                }
+            )
+
+        matched_rows = [
+            row
+            for row in verification_rows
+            if row.get("matched")
+        ]
+        matched_rows.sort(
+            key=lambda row: row.get("best_score") or 0.0,
+            reverse=True
+        )
+        best_row = matched_rows[0] if matched_rows else None
+        verified_identity = best_row.get("database_match") if best_row else None
+
+        if verified_identity:
+            conclusion = {
+                "decision": "VERIFIED",
+                "summary": (
+                    "DB + OSINT verified. At least one OSINT avatar matched a "
+                    "registered database face."
+                )
+            }
+        elif verification_rows:
+            conclusion = {
+                "decision": "NOT VERIFIED",
+                "summary": (
+                    "OSINT profiles were found, but no avatar confidently matched "
+                    "a registered database face."
+                )
+            }
+        else:
+            conclusion = {
+                "decision": "NO AVATAR",
+                "summary": "No OSINT avatar image was available for face verification."
+            }
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "job_id": job_id,
+                "verified_identity": verified_identity,
+                "conclusion": conclusion,
+                "avatar_verifications": verification_rows,
+                "normalized": normalized_data
+            }
+        )
+
+    except Exception as e:
+        logger.exception("OSINT avatar verification failed: job_id=%s", job_id)
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
         request_database_service.close()
 
 
@@ -1020,6 +1677,26 @@ async def receive_osint_results(
             completed_job.get("results") is not None
         )
 
+        try:
+
+            normalized_counts = osint_normalizer_service.normalize_and_store(
+                job_id=completed_job.get("job_id"),
+                payload=payload,
+                database_service=request_database_service
+            )
+            logger.info(
+                "OSINT webhook normalized: job_id=%s counts=%s",
+                completed_job.get("job_id"),
+                normalized_counts
+            )
+
+        except Exception:
+
+            logger.exception(
+                "OSINT normalization failed after raw result storage: job_id=%s",
+                completed_job.get("job_id")
+            )
+
         return JSONResponse(
             status_code=200,
             content={
@@ -1055,6 +1732,154 @@ async def receive_osint_results(
 
         request_database_service.close()
 
+
+@app.post("/api/v1/jobs/document-validation")
+async def submit_document_validation_job(
+
+    background_tasks: BackgroundTasks,
+
+    document_type: str = Form(...),
+
+    document: UploadFile = File(...),
+
+    aadhar_number: str = Form(""),
+
+    pan_number: str = Form(""),
+
+    voter_id_number: str = Form(""),
+
+    driving_license_number: str = Form(""),
+
+    passport_number: str = Form("")
+
+):
+    """Create a background document-validation job and return immediately."""
+
+    request_database_service = DatabaseService()
+
+    try:
+
+        logger.info(
+            "Document validation async job creation requested: document_type=%s filename=%s",
+            document_type,
+            document.filename
+        )
+        saved_file_path = file_service.save_upload(document)
+        manual_values = {
+            "aadhar_number": aadhar_number,
+            "pan_number": pan_number,
+            "voter_id_number": voter_id_number,
+            "driving_license_number": driving_license_number,
+            "passport_number": passport_number
+        }
+        document_job = request_database_service.create_document_validation_job(
+            document_type=document_type,
+            uploaded_document_path=saved_file_path,
+            original_filename=document.filename,
+            manual_values=manual_values
+        )
+        job_id = document_job.get("job_id")
+        background_tasks.add_task(
+            run_document_validation_job_background,
+            job_id,
+            document_type,
+            saved_file_path,
+            document.filename,
+            manual_values
+        )
+        logger.info(
+            "Document validation async job queued: job_id=%s document_type=%s path=%s",
+            job_id,
+            document_type,
+            saved_file_path
+        )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": "Document validation queued successfully",
+                "job": document_job
+            }
+        )
+
+    except ValueError as e:
+
+        logger.exception("Document validation async validation failed")
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    except Exception as e:
+
+        logger.exception("Document validation async job submission failed")
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+
+        request_database_service.close()
+
+
+@app.get("/api/v1/jobs/document-validation/{job_id}")
+async def get_document_validation_job(
+
+    job_id: str
+
+):
+    """Return one background document-validation job for dashboard polling."""
+
+    request_database_service = DatabaseService()
+
+    try:
+
+        request_database_service.mark_stale_document_validation_jobs_failed(
+            settings.DOCUMENT_VALIDATION_JOB_STALE_MINUTES
+        )
+        job = request_database_service.get_document_validation_job(job_id)
+
+        if not job:
+
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": f"Document validation job not found: {job_id}"
+                }
+            )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "job": job
+            }
+        )
+
+    except Exception as e:
+
+        logger.exception("Document validation job lookup failed: job_id=%s", job_id)
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+
+        request_database_service.close()
 
 @app.post("/validate-id")
 async def validate_id(

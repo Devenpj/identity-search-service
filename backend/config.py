@@ -81,6 +81,12 @@ class Settings:
             "20"
         )
     )
+    OSINT_JOB_STALE_MINUTES = int(
+        os.environ.get(
+            "OSINT_JOB_STALE_MINUTES",
+            "15"
+        )
+    )
     FACE_MATCH_THRESHOLD = float(
         os.environ.get(
             "FACE_MATCH_THRESHOLD",
@@ -113,6 +119,18 @@ class Settings:
         os.environ.get(
             "FACE_ENGINE_BATCH_SIZE",
             "100"
+        )
+    )
+    FACE_SEARCH_JOB_STALE_MINUTES = int(
+        os.environ.get(
+            "FACE_SEARCH_JOB_STALE_MINUTES",
+            "30"
+        )
+    )
+    DOCUMENT_VALIDATION_JOB_STALE_MINUTES = int(
+        os.environ.get(
+            "DOCUMENT_VALIDATION_JOB_STALE_MINUTES",
+            "30"
         )
     )
 
