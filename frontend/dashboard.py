@@ -2853,7 +2853,6 @@ def render_osint_avatar_verification(job):
             ("OSINT Avatar", avatar_image_value),
             ("Profile URL", "profile_url"),
             ("Matched", "matched"),
-            ("Best Score", "best_score"),
             ("DB Employee ID", lambda row: (row.get("database_match") or {}).get("employee_id")),
             ("DB Name", lambda row: (row.get("database_match") or {}).get("full_name")),
             ("Message", "message")

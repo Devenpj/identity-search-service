@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+from datetime import datetime
 from uuid import uuid4
 
 import requests
@@ -36,6 +37,7 @@ try:
     from ..services.ocr_service import OCRService
     from ..services.osint_normalizer_service import OSINTNormalizerService
     from ..services.osint_service import OSINTService
+    from ..services.news_database_service import NewsDatabaseService
     from ..services.risk_service import RiskScoringService
 except ImportError:
     from config import settings
@@ -47,6 +49,7 @@ except ImportError:
     from services.ocr_service import OCRService
     from services.osint_normalizer_service import OSINTNormalizerService
     from services.osint_service import OSINTService
+    from services.news_database_service import NewsDatabaseService
     from services.risk_service import RiskScoringService
 
 from utils.logger import configure_logging
@@ -144,6 +147,90 @@ def osint_health_payload(check_network=False):
         status_code = 503
 
     return payload, status_code
+
+
+def news_database_health_payload():
+    """Check the optional external Docker/PostgreSQL news database."""
+
+    if not NewsDatabaseService.is_configured():
+
+        return {
+            "status": "ok",
+            "configured": False,
+            "mode": "local",
+            "message": "NEWS_DATABASE_URL is not configured; using local news tables"
+        }, 200
+
+    health_news_database_service = None
+
+    try:
+        health_news_database_service = NewsDatabaseService()
+        health_news_database_service.cursor.execute("SELECT 1")
+        health_news_database_service.cursor.fetchone()
+
+        return {
+            "status": "ok",
+            "configured": True,
+            "mode": "external",
+            "webhook_configured": bool(settings.NEWS_WEBHOOK_TOKEN),
+            "message": "External news database connection is healthy"
+        }, 200
+
+    except Exception as error:
+        logger.exception("External news database health check failed")
+
+        return {
+            "status": "error",
+            "configured": True,
+            "mode": "external",
+            "message": str(error)
+        }, 503
+
+    finally:
+        if health_news_database_service:
+            health_news_database_service.close()
+
+
+def open_news_database_service():
+    """Open the external news DB when configured, otherwise use local tables."""
+
+    if not NewsDatabaseService.is_configured():
+
+        return database_service, False, "local"
+
+    try:
+        return NewsDatabaseService(), True, "external"
+
+    except Exception:
+        logger.exception(
+            "External news database unavailable; using local news tables"
+        )
+
+        return database_service, False, "local_fallback"
+
+
+def execute_news_database_operation(operation_name, callback):
+    """Run one news query against Docker DB, then local fallback if needed."""
+
+    news_database_service, should_close, data_source = open_news_database_service()
+
+    try:
+        return callback(news_database_service), data_source
+
+    except Exception:
+        if should_close:
+            logger.exception(
+                "External news database operation failed: %s. Retrying local news tables.",
+                operation_name
+            )
+
+            return callback(database_service), "local_fallback"
+
+        raise
+
+    finally:
+        if should_close:
+            news_database_service.close()
 
 """Helper functions for validating and normalizing identity search criteria and OSINT targets."""
 
@@ -656,21 +743,34 @@ def health_osint(
     )
 
 
+@app.get(settings.NEWS_HEALTH_PATH)
+def health_news_database():
+    """Return optional external news database connectivity health."""
+
+    payload, status_code = news_database_health_payload()
+
+    return JSONResponse(
+        status_code=status_code,
+        content=payload
+    )
+
+
 @app.get("/health/full")
 def health_full(
 
     check_osint_network: bool = Query(False)
 
 ):
-    """Return API, DB, and OSINT health in one response."""
+    """Return API, DB, news DB, and OSINT health in one response."""
 
     db_payload, db_status_code = database_health_payload()
+    news_db_payload, news_db_status_code = news_database_health_payload()
     osint_payload, osint_status_code = osint_health_payload(
         check_network=check_osint_network
     )
     status_code = 200
 
-    if db_status_code >= 400 or osint_status_code >= 400:
+    if db_status_code >= 400 or osint_status_code >= 400 or news_db_status_code >= 400:
         status_code = 503
 
     return JSONResponse(
@@ -682,10 +782,10 @@ def health_full(
                 "status": "ok"
             },
             "database": db_payload,
+            "news_database": news_db_payload,
             "osint": osint_payload
         }
     )
-
 
 """Starting of the search-identity route which accepts one field and value to search in the database."""
 
@@ -1411,6 +1511,278 @@ async def verify_osint_avatars(
         request_database_service.close()
 
 
+@app.post(settings.NEWS_WEBHOOK_PATH)
+async def receive_news_update(
+
+    payload: dict = Body(
+        ...,
+        example={
+            "batch_id": "NEWS-20260702-001",
+            "status": "completed",
+            "completed_at": "2026-07-02T10:30:00+05:30",
+            "counts": {
+                "clusters": 12,
+                "articles": 240,
+                "cluster_entities": 90,
+                "article_entities": 820
+            }
+        }
+    ),
+
+    x_news_webhook_secret: str = Header(
+        "",
+        alias=settings.NEWS_WEBHOOK_HEADER_NAME
+    )
+
+):
+    """Acknowledge a completed/failed scraper batch and verify remote data."""
+
+    request_database_service = None
+    remote_news_database_service = None
+    batch_id = str(payload.get("batch_id") or "").strip()
+
+    try:
+
+        expected_token = str(settings.NEWS_WEBHOOK_TOKEN or "")
+
+        if not expected_token:
+
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "message": "NEWS_WEBHOOK_TOKEN is not configured"
+                }
+            )
+
+        if not hmac.compare_digest(x_news_webhook_secret, expected_token):
+
+            logger.warning(
+                "News webhook rejected: reason=invalid_token batch_id=%s",
+                batch_id or "-"
+            )
+
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "status": "error",
+                    "message": "Invalid news webhook token"
+                }
+            )
+
+        payload_size = len(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+
+        if payload_size > settings.NEWS_WEBHOOK_MAX_PAYLOAD_BYTES:
+
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "status": "error",
+                    "message": "News webhook payload is too large"
+                }
+            )
+
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", batch_id):
+
+            raise ValueError(
+                "batch_id is required and may contain letters, numbers, dot, underscore, colon, or hyphen"
+            )
+
+        normalized_status = str(payload.get("status") or "").strip().upper()
+
+        if normalized_status not in {"COMPLETED", "FAILED"}:
+
+            raise ValueError("status must be completed or failed")
+
+        counts = payload.get("counts") or {}
+
+        if not isinstance(counts, dict):
+
+            raise ValueError("counts must be a JSON object")
+
+        for count_name, count_value in counts.items():
+
+            if isinstance(count_value, bool) or not isinstance(count_value, int) or count_value < 0:
+
+                raise ValueError(
+                    f"counts.{count_name} must be a non-negative integer"
+                )
+
+        completed_at = payload.get("completed_at")
+
+        if completed_at:
+
+            try:
+                datetime.fromisoformat(
+                    str(completed_at).replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "completed_at must be an ISO-8601 datetime"
+                ) from error
+
+        request_database_service = DatabaseService()
+        database_snapshot = None
+        error_message = payload.get("error") or payload.get("message")
+
+        logger.info(
+            "News webhook received: batch_id=%s status=%s reported_counts=%s",
+            batch_id,
+            normalized_status,
+            counts
+        )
+
+        if normalized_status == "COMPLETED":
+
+            if not NewsDatabaseService.is_configured():
+
+                raise ConnectionError(
+                    "NEWS_DATABASE_URL is not configured; remote batch cannot be verified"
+                )
+
+            try:
+                remote_news_database_service = NewsDatabaseService()
+                database_snapshot = remote_news_database_service.get_data_snapshot()
+            except Exception as error:
+                failure_message = (
+                    "Remote news database verification failed: "
+                    f"{error}"
+                )
+                request_database_service.save_news_ingestion_event(
+                    batch_id=batch_id,
+                    status="FAILED",
+                    payload=payload,
+                    reported_counts=counts,
+                    error_message=failure_message,
+                    engine_completed_at=completed_at
+                )
+                logger.exception(
+                    "News webhook failed: batch_id=%s reason=remote_database_unavailable",
+                    batch_id
+                )
+
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "error",
+                        "batch_id": batch_id,
+                        "message": failure_message
+                    }
+                )
+
+        event = request_database_service.save_news_ingestion_event(
+            batch_id=batch_id,
+            status=normalized_status,
+            payload=payload,
+            reported_counts=counts,
+            database_snapshot=database_snapshot,
+            source=str(payload.get("source") or "news-intelligence-engine"),
+            error_message=error_message if normalized_status == "FAILED" else None,
+            engine_completed_at=completed_at
+        )
+
+        logger.info(
+            "News webhook stored: batch_id=%s status=%s database_snapshot=%s",
+            batch_id,
+            normalized_status,
+            database_snapshot
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "message": "News batch notification accepted",
+                "batch": event
+            }
+        )
+
+    except ValueError as error:
+
+        logger.warning(
+            "News webhook validation failed: batch_id=%s error=%s",
+            batch_id or "-",
+            error
+        )
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": str(error)
+            }
+        )
+
+    except Exception as error:
+
+        logger.exception("News webhook processing failed: batch_id=%s", batch_id or "-")
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(error)
+            }
+        )
+
+    finally:
+
+        if remote_news_database_service:
+            remote_news_database_service.close()
+
+        if request_database_service:
+            request_database_service.close()
+
+
+@app.get(settings.NEWS_SYNC_STATUS_PATH)
+async def get_latest_news_sync_status(
+
+    include_live_snapshot: bool = Query(False)
+
+):
+    """Return the latest accepted news batch and optional current DB totals."""
+
+    request_database_service = None
+    remote_news_database_service = None
+
+    try:
+        request_database_service = DatabaseService()
+        event = request_database_service.get_latest_news_ingestion_event()
+        live_snapshot = None
+
+        if include_live_snapshot and NewsDatabaseService.is_configured():
+            remote_news_database_service = NewsDatabaseService()
+            live_snapshot = remote_news_database_service.get_data_snapshot()
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "latest_batch": event,
+                "live_snapshot": live_snapshot
+            }
+        )
+
+    except Exception as error:
+        logger.exception("Latest news sync status lookup failed")
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(error)
+            }
+        )
+
+    finally:
+        if remote_news_database_service:
+            remote_news_database_service.close()
+
+        if request_database_service:
+            request_database_service.close()
+
+
 @app.get("/api/v1/news/clusters/top")
 async def get_top_news_clusters(
 
@@ -1421,12 +1793,16 @@ async def get_top_news_clusters(
 
     try:
 
-        clusters = database_service.list_top_news_clusters(limit)
+        clusters, data_source = execute_news_database_operation(
+            "top news clusters",
+            lambda news_database_service: news_database_service.list_top_news_clusters(limit)
+        )
 
         return JSONResponse(
             content={
                 "status": "success",
                 "total_clusters": len(clusters),
+                "data_source": data_source,
                 "clusters": clusters
             }
         )
@@ -1443,7 +1819,6 @@ async def get_top_news_clusters(
             }
         )
 
-
 @app.get("/api/v1/news/search")
 async def search_news(
 
@@ -1456,9 +1831,12 @@ async def search_news(
 
     try:
 
-        clusters = database_service.search_news(
-            q,
-            limit
+        clusters, data_source = execute_news_database_operation(
+            "news search",
+            lambda news_database_service: news_database_service.search_news(
+                q,
+                limit
+            )
         )
 
         return JSONResponse(
@@ -1466,6 +1844,7 @@ async def search_news(
                 "status": "success",
                 "query": q,
                 "total_clusters": len(clusters),
+                "data_source": data_source,
                 "clusters": clusters
             }
         )
@@ -1482,7 +1861,6 @@ async def search_news(
             }
         )
 
-
 @app.get("/api/v1/news/topics")
 async def get_common_news_topics(
 
@@ -1493,12 +1871,16 @@ async def get_common_news_topics(
 
     try:
 
-        topics = database_service.list_common_news_topics(limit)
+        topics, data_source = execute_news_database_operation(
+            "common news topics",
+            lambda news_database_service: news_database_service.list_common_news_topics(limit)
+        )
 
         return JSONResponse(
             content={
                 "status": "success",
                 "total_topics": len(topics),
+                "data_source": data_source,
                 "topics": topics
             }
         )
@@ -1515,18 +1897,20 @@ async def get_common_news_topics(
             }
         )
 
-
 @app.get("/api/v1/news/clusters/{cluster_id}")
 async def get_news_cluster_detail(
 
-    cluster_id: int
+    cluster_id: str
 
 ):
     """Return one news cluster with sources, entities, and linked articles."""
 
     try:
 
-        cluster = database_service.get_news_cluster_detail(cluster_id)
+        cluster, data_source = execute_news_database_operation(
+            "news cluster detail",
+            lambda news_database_service: news_database_service.get_news_cluster_detail(cluster_id)
+        )
 
         if not cluster:
 
@@ -1541,6 +1925,7 @@ async def get_news_cluster_detail(
         return JSONResponse(
             content={
                 "status": "success",
+                "data_source": data_source,
                 "cluster": cluster
             }
         )
@@ -1556,7 +1941,6 @@ async def get_news_cluster_detail(
                 "message": str(e)
             }
         )
-
 
 @app.post("/api/webhooks/osint-results")
 async def receive_osint_results(

@@ -133,6 +133,40 @@ class Settings:
             "30"
         )
     )
+    NEWS_DATABASE_URL = os.environ.get(
+        "NEWS_DATABASE_URL",
+        ""
+    )
+    NEWS_WEBHOOK_URL = os.environ.get(
+        "NEWS_WEBHOOK_URL",
+        ""
+    )
+    NEWS_WEBHOOK_PATH = os.environ.get(
+        "NEWS_WEBHOOK_PATH",
+        "/api/webhooks/news-updated"
+    )
+    NEWS_WEBHOOK_HEADER_NAME = os.environ.get(
+        "NEWS_WEBHOOK_HEADER_NAME",
+        "X-News-Webhook-Secret"
+    )
+    NEWS_SYNC_STATUS_PATH = os.environ.get(
+        "NEWS_SYNC_STATUS_PATH",
+        "/api/v1/news/sync-status/latest"
+    )
+    NEWS_HEALTH_PATH = os.environ.get(
+        "NEWS_HEALTH_PATH",
+        "/health/news-db"
+    )
+    NEWS_WEBHOOK_TOKEN = os.environ.get(
+        "NEWS_WEBHOOK_TOKEN",
+        ""
+    )
+    NEWS_WEBHOOK_MAX_PAYLOAD_BYTES = int(
+        os.environ.get(
+            "NEWS_WEBHOOK_MAX_PAYLOAD_BYTES",
+            "65536"
+        )
+    )
 
 
 settings = Settings()

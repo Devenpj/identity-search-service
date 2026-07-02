@@ -52,7 +52,34 @@ class DatabaseService:
             self._ensure_face_search_jobs_table()
             self._ensure_document_validation_jobs_table()
             self._ensure_osint_normalized_tables()
+            self._ensure_news_ingestion_events_table()
             DatabaseService._schema_ready = True
+
+    def _ensure_news_ingestion_events_table(self):
+        """Create the idempotent audit table for news-engine webhook batches."""
+
+        query = """
+        CREATE TABLE IF NOT EXISTS news_ingestion_events (
+            batch_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'news-intelligence-engine',
+            reported_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            database_snapshot JSONB,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            error_message TEXT,
+            engine_completed_at TIMESTAMPTZ,
+            received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT news_ingestion_events_status_check
+                CHECK (status IN ('COMPLETED', 'FAILED'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_news_ingestion_events_received_at
+        ON news_ingestion_events(received_at DESC);
+        """
+
+        self.cursor.execute(query)
+        self.connection.commit()
 
     def _ensure_manual_review_table(self):
         """Create the manual review queue table used by reviewer workflows."""
@@ -1922,6 +1949,122 @@ class DatabaseService:
     # NEWS INTELLIGENCE
     # -----------------------------------
 
+    def save_news_ingestion_event(
+        self,
+        batch_id,
+        status,
+        payload,
+        reported_counts=None,
+        database_snapshot=None,
+        source="news-intelligence-engine",
+        error_message=None,
+        engine_completed_at=None
+    ):
+        """Insert or update one news batch receipt using batch_id idempotency."""
+
+        normalized_status = str(status or "").strip().upper()
+
+        if normalized_status not in {"COMPLETED", "FAILED"}:
+
+            raise ValueError("News batch status must be COMPLETED or FAILED")
+
+        query = """
+        INSERT INTO news_ingestion_events (
+            batch_id,
+            status,
+            source,
+            reported_counts,
+            database_snapshot,
+            payload,
+            error_message,
+            engine_completed_at
+        )
+        VALUES (
+            %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::timestamptz
+        )
+        ON CONFLICT (batch_id) DO UPDATE
+        SET
+            status = EXCLUDED.status,
+            source = EXCLUDED.source,
+            reported_counts = EXCLUDED.reported_counts,
+            database_snapshot = EXCLUDED.database_snapshot,
+            payload = EXCLUDED.payload,
+            error_message = EXCLUDED.error_message,
+            engine_completed_at = EXCLUDED.engine_completed_at,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING
+            batch_id,
+            status,
+            source,
+            reported_counts,
+            database_snapshot,
+            error_message,
+            engine_completed_at,
+            received_at,
+            updated_at
+        """
+
+        self.cursor.execute(
+            query,
+            (
+                batch_id,
+                normalized_status,
+                source,
+                json.dumps(reported_counts or {}),
+                json.dumps(database_snapshot),
+                json.dumps(payload or {}),
+                error_message,
+                engine_completed_at
+            )
+        )
+        row = self.cursor.fetchone()
+        self.connection.commit()
+
+        return self._format_news_ingestion_event(row)
+
+    def get_latest_news_ingestion_event(self):
+        """Return the most recently received news-engine batch notification."""
+
+        self.cursor.execute(
+            """
+            SELECT
+                batch_id,
+                status,
+                source,
+                reported_counts,
+                database_snapshot,
+                error_message,
+                engine_completed_at,
+                received_at,
+                updated_at
+            FROM news_ingestion_events
+            ORDER BY received_at DESC
+            LIMIT 1
+            """
+        )
+
+        return self._format_news_ingestion_event(self.cursor.fetchone())
+
+    @staticmethod
+    def _format_news_ingestion_event(row):
+        """Convert one news batch audit row to a JSON-safe dictionary."""
+
+        if not row:
+
+            return None
+
+        return {
+            "batch_id": row[0],
+            "status": row[1],
+            "source": row[2],
+            "reported_counts": row[3] or {},
+            "database_snapshot": row[4],
+            "error_message": row[5],
+            "engine_completed_at": row[6].isoformat() if row[6] else None,
+            "received_at": row[7].isoformat() if row[7] else None,
+            "updated_at": row[8].isoformat() if row[8] else None
+        }
+
     def list_top_news_clusters(
         self,
         limit=10
@@ -1997,6 +2140,7 @@ class DatabaseService:
         LEFT JOIN source_rank sr ON sr.cluster_id = c.cluster_id
             AND sr.row_number = 1
         LEFT JOIN entity_payload ep ON ep.cluster_id = c.cluster_id
+        WHERE c.cluster_id <> 'UNCATEGORIZED'
         ORDER BY
             COALESCE(ac.actual_article_count, c.article_count, 0) DESC,
             c.updated_at DESC NULLS LAST,
@@ -2239,7 +2383,9 @@ class DatabaseService:
                 ) AS match_score
             FROM clusters c
             CROSS JOIN search s
-            WHERE c.cluster_name ILIKE s.pattern
+            WHERE c.cluster_id <> 'UNCATEGORIZED'
+            AND (
+                c.cluster_name ILIKE s.pattern
             OR c.cluster_summary ILIKE s.pattern
             OR EXISTS (
                 SELECT 1
@@ -2263,6 +2409,7 @@ class DatabaseService:
                 JOIN article_entities ae ON ae.article_id = a.article_id
                 WHERE a.cluster_id = c.cluster_id
                 AND ae.entity_name ILIKE s.pattern
+            )
             )
         ),
         entity_rank AS (
@@ -2308,6 +2455,7 @@ class DatabaseService:
         JOIN clusters c ON c.cluster_id = mc.cluster_id
         LEFT JOIN article_counts ac ON ac.cluster_id = c.cluster_id
         LEFT JOIN entity_payload ep ON ep.cluster_id = c.cluster_id
+        WHERE c.cluster_id <> 'UNCATEGORIZED'
         ORDER BY
             mc.match_score DESC,
             COALESCE(ac.actual_article_count, c.article_count, 0) DESC,
