@@ -27,6 +27,12 @@ FACE_ENGINE_DET_SIZE = int(
         "640"
     )
 )
+FACE_ENGINE_DET_THRESHOLD = float(
+    os.environ.get(
+        "FACE_ENGINE_DET_THRESHOLD",
+        "0.35"
+    )
+)
 FACE_ENGINE_THRESHOLD = float(
     os.environ.get(
         "FACE_ENGINE_THRESHOLD",
@@ -57,6 +63,7 @@ def load_face_app():
     )
     app.prepare(
         ctx_id=0,
+        det_thresh=FACE_ENGINE_DET_THRESHOLD,
         det_size=(
             FACE_ENGINE_DET_SIZE,
             FACE_ENGINE_DET_SIZE
@@ -130,7 +137,7 @@ def largest_face(faces):
     )
 
 
-def extract_embedding(image_path):
+def extract_embedding(image_path, assume_cropped=False):
     """Return a cached normalized face embedding for one image path."""
 
     if not image_path:
@@ -148,7 +155,8 @@ def extract_embedding(image_path):
     return _extract_embedding_cached(
         resolved_path,
         file_stats.st_mtime_ns,
-        file_stats.st_size
+        file_stats.st_size,
+        bool(assume_cropped)
     )
 
 
@@ -156,35 +164,112 @@ def extract_embedding(image_path):
 def _extract_embedding_cached(
     image_path,
     modified_time,
-    file_size
+    file_size,
+    assume_cropped
 ):
     """Compute and cache one face embedding until the source file changes."""
 
     image = load_image(image_path)
     app = load_face_app()
-    faces = app.get(image)
+    detection_image = image
+    faces = app.get(detection_image)
     face = largest_face(faces)
 
-    if face is None:
+    if face is None and min(image.shape[:2]) < 320:
+        scale = min(
+            4.0,
+            max(2.0, 320.0 / max(1, min(image.shape[:2])))
+        )
+        detection_image = cv2.resize(
+            image,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC
+        )
+        faces = app.get(detection_image)
+        face = largest_face(faces)
+
+    extraction_method = "detected_face"
+
+    if face is None and assume_cropped:
+        height, width = image.shape[:2]
+        aspect_ratio = width / max(1, height)
+
+        if min(height, width) < 64 or not 0.65 <= aspect_ratio <= 1.55:
+
+            raise ValueError(
+                f"No face detected and image is not a valid profile crop: {image_path}"
+            )
+
+        recognition_model = app.models.get("recognition")
+
+        if recognition_model is None:
+
+            raise ValueError("InsightFace recognition model is unavailable")
+
+        aligned_crop = cv2.resize(
+            image,
+            (112, 112),
+            interpolation=cv2.INTER_CUBIC
+        )
+        embedding = np.asarray(
+            recognition_model.get_feat(aligned_crop),
+            dtype=np.float32
+        ).reshape(-1)
+        embedding_norm = float(np.linalg.norm(embedding))
+
+        if embedding_norm <= 0:
+
+            raise ValueError(f"Could not encode cropped profile image: {image_path}")
+
+        embedding = embedding / embedding_norm
+        bbox = [0.0, 0.0, float(width), float(height)]
+        detection_score = None
+        extraction_method = "trusted_profile_crop"
+
+    elif face is None:
 
         raise ValueError(f"No face detected in image: {image_path}")
 
-    embedding = np.asarray(
-        face.normed_embedding,
-        dtype=np.float32
-    )
-    bbox = [
-        round(float(value), 2)
-        for value in face.bbox
-    ]
+    else:
+        embedding = np.asarray(
+            face.normed_embedding,
+            dtype=np.float32
+        )
+        bbox = [
+            round(float(value), 2)
+            for value in face.bbox
+        ]
+        detection_score = round(float(face.det_score), 4)
 
     return {
         "embedding": embedding,
         "quality": image_quality(image),
         "bbox": bbox,
-        "det_score": round(float(face.det_score), 4)
+        "det_score": detection_score,
+        "extraction_method": extraction_method
     }
 
+
+def embedding_payload(image_path, assume_cropped=False):
+    """Return one JSON-safe normalized embedding and its extraction metadata."""
+
+    extracted = extract_embedding(image_path, assume_cropped=assume_cropped)
+    embedding = np.asarray(
+        extracted["embedding"],
+        dtype=np.float32
+    )
+
+    return {
+        "embedding": embedding.tolist(),
+        "dimension": int(embedding.shape[0]),
+        "model_name": FACE_ENGINE_MODEL,
+        "quality": extracted["quality"],
+        "bbox": extracted["bbox"],
+        "det_score": extracted["det_score"],
+        "extraction_method": extracted["extraction_method"]
+    }
 
 def cosine_similarity(
     embedding_one,

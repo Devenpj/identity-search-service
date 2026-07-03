@@ -87,6 +87,12 @@ class Settings:
             "15"
         )
     )
+    OSINT_FACE_IMAGE_MAX_BYTES = int(
+        os.environ.get(
+            "OSINT_FACE_IMAGE_MAX_BYTES",
+            "5242880"
+        )
+    )
     FACE_MATCH_THRESHOLD = float(
         os.environ.get(
             "FACE_MATCH_THRESHOLD",
@@ -120,6 +126,28 @@ class Settings:
             "FACE_ENGINE_BATCH_SIZE",
             "100"
         )
+    )
+    FACE_ENGINE_MATCH_THRESHOLD = float(
+        os.environ.get(
+            "FACE_ENGINE_MATCH_THRESHOLD",
+            "0.38"
+        )
+    )
+    FACE_ENGINE_MIN_SCORE_GAP = float(
+        os.environ.get(
+            "FACE_ENGINE_MIN_SCORE_GAP",
+            "0.05"
+        )
+    )
+    FACE_ENGINE_STRONG_MATCH_THRESHOLD = float(
+        os.environ.get(
+            "FACE_ENGINE_STRONG_MATCH_THRESHOLD",
+            "0.45"
+        )
+    )
+    FACE_EMBEDDING_MODEL = os.environ.get(
+        "FACE_EMBEDDING_MODEL",
+        "buffalo_l"
     )
     FACE_SEARCH_JOB_STALE_MINUTES = int(
         os.environ.get(

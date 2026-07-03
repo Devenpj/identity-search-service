@@ -1,5 +1,6 @@
 """OpenCV-based face comparison used by document and face search flows."""
 
+import hashlib
 import os
 import threading
 from urllib.parse import urljoin
@@ -113,7 +114,8 @@ class FaceVerificationService:
     def find_best_database_match(
         self,
         uploaded_face_path,
-        database_people
+        database_people,
+        embedding_candidates=None
     ):
         """Compare one uploaded face against all database photos and keep best hit."""
 
@@ -122,6 +124,17 @@ class FaceVerificationService:
             return self._no_comparable_faces_result(
                 "No face image was uploaded for comparison"
             )
+
+        if embedding_candidates:
+
+            vector_result = self._find_best_with_persisted_embeddings(
+                uploaded_face_path,
+                embedding_candidates
+            )
+
+            if vector_result:
+
+                return vector_result
 
         external_result = self._find_best_with_external_engine(
             uploaded_face_path,
@@ -267,6 +280,210 @@ class FaceVerificationService:
 
             return None
 
+    def extract_external_embedding(self, image_path, assume_cropped=False):
+        """Request one normalized embedding from the isolated InsightFace API."""
+
+        if not self._external_engine_enabled():
+
+            raise ValueError("FACE_ENGINE_URL is not configured")
+
+        response = requests.post(
+            self._engine_url("/embedding"),
+            json={
+                "image_path": os.path.abspath(image_path),
+                "assume_cropped": bool(assume_cropped)
+            },
+            timeout=settings.FACE_ENGINE_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if payload.get("status") != "success":
+
+            raise ValueError(
+                payload.get("message") or "Face engine embedding extraction failed"
+            )
+
+        embedding_payload = payload.get("embedding") or {}
+        embedding = np.asarray(
+            embedding_payload.get("embedding") or [],
+            dtype=np.float32
+        )
+
+        if embedding.shape != (512,):
+
+            raise ValueError(
+                f"InsightFace returned embedding shape {embedding.shape}; expected (512,)"
+            )
+
+        norm = float(np.linalg.norm(embedding))
+
+        if norm <= 0:
+
+            raise ValueError("InsightFace returned an empty embedding")
+
+        embedding_payload["embedding"] = (embedding / norm).tolist()
+
+        return embedding_payload
+
+    def photo_fingerprint(self, photo_path):
+        """Return SHA-256 for detecting changed profile photos during enrollment."""
+
+        resolved_path = self.resolve_database_photo_path(photo_path)
+
+        if not resolved_path or not os.path.exists(resolved_path):
+
+            raise ValueError(f"Profile photo does not exist: {photo_path}")
+
+        digest = hashlib.sha256()
+
+        with open(resolved_path, "rb") as photo_file:
+            for chunk in iter(lambda: photo_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+
+        return digest.hexdigest()
+
+    def _find_best_with_persisted_embeddings(
+        self,
+        uploaded_face_path,
+        candidates
+    ):
+        """Search PostgreSQL-stored embeddings with one vectorized cosine pass."""
+
+        if not self._external_engine_enabled() or not candidates:
+
+            return None
+
+        try:
+            probe_payload = self.extract_external_embedding(uploaded_face_path)
+            probe_embedding = np.asarray(
+                probe_payload.get("embedding") or [],
+                dtype=np.float32
+            )
+            candidate_embeddings = np.asarray(
+                [candidate.get("embedding") for candidate in candidates],
+                dtype=np.float32
+            )
+
+            if candidate_embeddings.ndim != 2 or candidate_embeddings.shape[1] != 512:
+
+                raise ValueError("Stored face embeddings must have shape (N, 512)")
+
+            norms = np.linalg.norm(candidate_embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            candidate_embeddings = candidate_embeddings / norms
+            scores = candidate_embeddings @ probe_embedding
+            ranked_indices = np.argsort(scores)[::-1]
+            ranked_candidates = []
+
+            for candidate_index in ranked_indices[:5]:
+                candidate = candidates[int(candidate_index)]
+                score = round(float(scores[int(candidate_index)]), 4)
+                ranked_candidates.append(
+                    {
+                        "employee_id": candidate.get("employee_id"),
+                        "full_name": candidate.get("full_name"),
+                        "score": score,
+                        "matched_raw_threshold": score >= settings.FACE_ENGINE_MATCH_THRESHOLD,
+                        "photo_path": candidate.get("photo_path"),
+                        "quality": candidate.get("embedding_quality") or {},
+                        "score_details": {
+                            "cosine_similarity": score
+                        }
+                    }
+                )
+
+            best_candidate = ranked_candidates[0] if ranked_candidates else None
+            best_score = best_candidate.get("score", 0.0) if best_candidate else 0.0
+            second_best_score = (
+                ranked_candidates[1].get("score", 0.0)
+                if len(ranked_candidates) > 1
+                else 0.0
+            )
+            score_gap = round(best_score - second_best_score, 4)
+            confident_match = bool(
+                best_candidate
+                and best_score >= settings.FACE_ENGINE_MATCH_THRESHOLD
+                and (
+                    score_gap >= settings.FACE_ENGINE_MIN_SCORE_GAP
+                    or best_score >= settings.FACE_ENGINE_STRONG_MATCH_THRESHOLD
+                )
+            )
+            best_identity = None
+
+            if confident_match and best_candidate:
+                best_employee_id = best_candidate.get("employee_id")
+                best_identity = next(
+                    (
+                        self._identity_without_embedding(candidate)
+                        for candidate in candidates
+                        if candidate.get("employee_id") == best_employee_id
+                    ),
+                    None
+                )
+
+            return {
+                "matched": confident_match,
+                "best_score": best_score,
+                "second_best_score": second_best_score,
+                "score_gap": score_gap,
+                "best_match": best_identity,
+                "face_verification": {
+                    "matched": confident_match,
+                    "score": best_score,
+                    "second_best_score": second_best_score,
+                    "score_gap": score_gap,
+                    "threshold": settings.FACE_ENGINE_MATCH_THRESHOLD,
+                    "min_score_gap": settings.FACE_ENGINE_MIN_SCORE_GAP,
+                    "strong_match_threshold": settings.FACE_ENGINE_STRONG_MATCH_THRESHOLD,
+                    "method": "insightface_arcface_postgresql_array",
+                    "uploaded_face_path": uploaded_face_path,
+                    "database_face_path": (
+                        best_candidate.get("photo_path")
+                        if best_candidate
+                        else None
+                    ),
+                    "quality": {
+                        "probe": probe_payload.get("quality") or {},
+                        "best_candidate": (
+                            best_candidate.get("quality")
+                            if best_candidate
+                            else None
+                        )
+                    },
+                    "error": (
+                        None
+                        if confident_match
+                        else "No confident InsightFace vector match was found."
+                    )
+                },
+                "top_candidates": ranked_candidates
+            }
+
+        except Exception as error:
+
+            print(
+                "Persistent embedding search unavailable; "
+                f"falling back to candidate image search. Reason: {error}"
+            )
+
+            return None
+
+    @staticmethod
+    def _identity_without_embedding(candidate):
+        """Remove internal vector metadata before returning identity JSON."""
+
+        return {
+            key: value
+            for key, value in candidate.items()
+            if key not in {
+                "embedding",
+                "embedding_quality",
+                "embedding_detection_score",
+                "embedding_model",
+                "photo_hash"
+            }
+        }
     def _find_best_with_external_engine(
         self,
         uploaded_face_path,

@@ -1,7 +1,7 @@
 # OSINT Webhook Integration Setup
 
 The identity search keeps returning PostgreSQL matches immediately. When the
-search includes Full Name, Email, or Phone Number and OSINT is configured, the
+operator approves filled identity fields or a Face Image and OSINT is configured, the
 backend also creates an OSINT job and submits it to the external provider after
 the search response has been returned.
 
@@ -16,6 +16,7 @@ OSINT_SCAN_PATH=/api/v1/scan
 OSINT_CALLBACK_URL=https://your-public-backend.example.com/api/webhooks/osint-results
 OSINT_WEBHOOK_TOKEN=replace-with-random-webhook-token
 OSINT_REQUEST_TIMEOUT_SECONDS=20
+OSINT_FACE_IMAGE_MAX_BYTES=5242880
 ```
 
 `OSINT_CALLBACK_URL` must be publicly reachable by the external OSINT server.
@@ -82,11 +83,27 @@ X-API-Key: <OSINT_API_KEY>
     {
       "key": "phone_number",
       "value": "9999999999"
+    },
+    {
+      "key": "face_image",
+      "value": {
+        "filename": "person.jpg",
+        "content_type": "image/jpeg",
+        "encoding": "base64",
+        "size_bytes": 245810,
+        "base64_data": "<BASE64_IMAGE_DATA>"
+      }
     }
   ],
   "callback_url": "https://public-backend.example.com/api/webhooks/osint-results?webhook_token=..."
 }
 ```
+
+The `face_image` target is optional and is sent only after the dashboard user
+approves it. The provider must Base64-decode `value.base64_data` before running
+its face/image workflow. The identity-search backend validates the image as
+JPEG or PNG and does not write the Base64 body to terminal logs or the local
+`osint_jobs.targets` audit column.
 
 Immediate provider response:
 

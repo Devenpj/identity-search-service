@@ -424,14 +424,22 @@ class OSINTService:
 
         for target in targets or []:
             key = str(target.get("key") or "-")
-            value = str(target.get("value") or "")
-            masked_value = value
+            raw_value = target.get("value")
 
-            if "@" in value and "." in value:
-                name, _, domain = value.partition("@")
-                masked_value = f"{name[:2]}***@{domain}"
-            elif len(value) > 6:
-                masked_value = f"{value[:3]}***{value[-2:]}"
+            if isinstance(raw_value, dict):
+                filename = str(raw_value.get("filename") or "face_image")
+                size_bytes = int(raw_value.get("size_bytes") or 0)
+                encoding = str(raw_value.get("encoding") or "binary")
+                masked_value = f"{filename} ({size_bytes} bytes, {encoding})"
+            else:
+                value = str(raw_value or "")
+                masked_value = value
+
+                if "@" in value and "." in value:
+                    name, _, domain = value.partition("@")
+                    masked_value = f"{name[:2]}***@{domain}"
+                elif len(value) > 6:
+                    masked_value = f"{value[:3]}***{value[-2:]}"
 
             summary.append(
                 {

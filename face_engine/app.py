@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from engine import embedding_payload
 from engine import load_face_app
 from engine import search_candidates
 from engine import verify_pair
@@ -15,6 +16,12 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+class EmbeddingRequest(BaseModel):
+    """Request for extracting one normalized face embedding."""
+
+    image_path: str
+    assume_cropped: bool = False
 
 class VerifyRequest(BaseModel):
     """Request for one-to-one face verification."""
@@ -50,6 +57,27 @@ def health():
         "engine": "insightface"
     }
 
+
+@app.post("/embedding")
+def embedding(request: EmbeddingRequest):
+    """Extract one normalized InsightFace embedding for persistent storage/search."""
+
+    try:
+
+        return {
+            "status": "success",
+            "embedding": embedding_payload(
+                request.image_path,
+                assume_cropped=request.assume_cropped
+            )
+        }
+
+    except Exception as error:
+
+        return {
+            "status": "error",
+            "message": str(error)
+        }
 
 @app.post("/verify")
 def verify(request: VerifyRequest):

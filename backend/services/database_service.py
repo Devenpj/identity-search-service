@@ -50,6 +50,7 @@ class DatabaseService:
             self._ensure_manual_review_table()
             self._ensure_osint_jobs_table()
             self._ensure_face_search_jobs_table()
+            self._ensure_face_embeddings_table()
             self._ensure_document_validation_jobs_table()
             self._ensure_osint_normalized_tables()
             self._ensure_news_ingestion_events_table()
@@ -188,6 +189,36 @@ class DatabaseService:
         self.cursor.execute(query)
         self.connection.commit()
 
+    def _ensure_face_embeddings_table(self):
+        """Create durable storage for normalized InsightFace embeddings."""
+
+        query = """
+        CREATE TABLE IF NOT EXISTS identity_face_embeddings (
+            employee_id TEXT PRIMARY KEY,
+            photo_path TEXT NOT NULL,
+            photo_hash TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            embedding_dimension INTEGER NOT NULL,
+            embedding REAL[] NOT NULL,
+            face_quality JSONB NOT NULL DEFAULT '{}'::jsonb,
+            detection_score REAL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT identity_face_embedding_dimension_check
+                CHECK (embedding_dimension > 0),
+            CONSTRAINT identity_face_embedding_array_check
+                CHECK (cardinality(embedding) = embedding_dimension)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_identity_face_embeddings_photo_hash
+        ON identity_face_embeddings(photo_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_identity_face_embeddings_model
+        ON identity_face_embeddings(model_name);
+        """
+
+        self.cursor.execute(query)
+        self.connection.commit()
     def _ensure_face_search_jobs_table(self):
         """Create the persisted face-search job table used for async polling."""
 
@@ -2069,7 +2100,7 @@ class DatabaseService:
         self,
         limit=10
     ):
-        """Return the highest-volume news clusters with source/entity context."""
+        """Return the latest news clusters with article/source/entity context."""
 
         limit = max(
             1,
@@ -2142,9 +2173,9 @@ class DatabaseService:
         LEFT JOIN entity_payload ep ON ep.cluster_id = c.cluster_id
         WHERE c.cluster_id <> 'UNCATEGORIZED'
         ORDER BY
-            COALESCE(ac.actual_article_count, c.article_count, 0) DESC,
             c.updated_at DESC NULLS LAST,
-            c.cluster_id
+            COALESCE(ac.actual_article_count, c.article_count, 0) DESC,
+            c.cluster_id DESC
         LIMIT %s
         """
 
@@ -3152,6 +3183,183 @@ class DatabaseService:
     # FACE SEARCH DATASET
     # -----------------------------------
 
+    def upsert_face_embedding(
+        self,
+        employee_id,
+        photo_path,
+        photo_hash,
+        model_name,
+        embedding,
+        face_quality=None,
+        detection_score=None
+    ):
+        """Persist one normalized embedding, replacing stale photo/model data."""
+
+        normalized_embedding = [float(value) for value in embedding or []]
+
+        if not normalized_embedding:
+
+            raise ValueError("Face embedding cannot be empty")
+
+        self.cursor.execute(
+            """
+            INSERT INTO identity_face_embeddings (
+                employee_id,
+                photo_path,
+                photo_hash,
+                model_name,
+                embedding_dimension,
+                embedding,
+                face_quality,
+                detection_score
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+            ON CONFLICT (employee_id) DO UPDATE
+            SET
+                photo_path = EXCLUDED.photo_path,
+                photo_hash = EXCLUDED.photo_hash,
+                model_name = EXCLUDED.model_name,
+                embedding_dimension = EXCLUDED.embedding_dimension,
+                embedding = EXCLUDED.embedding,
+                face_quality = EXCLUDED.face_quality,
+                detection_score = EXCLUDED.detection_score,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING employee_id
+            """,
+            (
+                str(employee_id or "").strip(),
+                str(photo_path or "").strip(),
+                str(photo_hash or "").strip(),
+                str(model_name or "").strip(),
+                len(normalized_embedding),
+                normalized_embedding,
+                json.dumps(face_quality or {}),
+                detection_score
+            )
+        )
+        row = self.cursor.fetchone()
+        self.connection.commit()
+
+        return row[0] if row else None
+
+    def delete_face_embedding(self, employee_id):
+        """Delete a stored embedding when an identity or photo is removed."""
+
+        self.cursor.execute(
+            "DELETE FROM identity_face_embeddings WHERE employee_id = %s",
+            (str(employee_id or "").strip(),)
+        )
+        deleted_rows = self.cursor.rowcount
+        self.connection.commit()
+
+        return deleted_rows
+
+    def get_face_embedding_index(self):
+        """Return stored metadata keyed by employee ID for incremental backfills."""
+
+        self.cursor.execute(
+            """
+            SELECT
+                employee_id,
+                photo_path,
+                photo_hash,
+                model_name,
+                embedding_dimension,
+                updated_at
+            FROM identity_face_embeddings
+            """
+        )
+
+        return {
+            row[0]: {
+                "employee_id": row[0],
+                "photo_path": row[1],
+                "photo_hash": row[2],
+                "model_name": row[3],
+                "embedding_dimension": row[4],
+                "updated_at": row[5].isoformat() if row[5] else None
+            }
+            for row in self.cursor.fetchall()
+        }
+
+    def get_identity_face_embedding_candidates(self):
+        """Return current identity records joined to matching stored embeddings."""
+
+        query = f"""
+        SELECT
+            d.employee_id,
+            d.full_name,
+            d.date_of_birth,
+            d.aadhar_number,
+            d.pan_number,
+            {self._select_extended_column("voter_id_number")},
+            {self._select_extended_column("driving_license_number")},
+            {self._select_extended_column("passport_number")},
+            d.phone_number,
+            d.email,
+            d.department,
+            d.state,
+            d.photo_path,
+            e.embedding,
+            e.face_quality,
+            e.detection_score,
+            e.model_name,
+            e.photo_hash
+        FROM demodataset d
+        JOIN identity_face_embeddings e
+            ON e.employee_id = d.employee_id
+            AND e.photo_path = d.photo_path
+        WHERE d.photo_path IS NOT NULL
+        AND TRIM(CAST(d.photo_path AS TEXT)) <> ''
+        AND e.embedding_dimension = 512
+        """
+
+        self.cursor.execute(query)
+        candidates = []
+
+        for row in self.cursor.fetchall():
+            person = self._format_identity_row(row[:13])
+            person.update(
+                {
+                    "embedding": row[13],
+                    "embedding_quality": row[14] or {},
+                    "embedding_detection_score": row[15],
+                    "embedding_model": row[16],
+                    "photo_hash": row[17]
+                }
+            )
+            candidates.append(person)
+
+        return candidates
+
+    def get_face_embedding_coverage(self):
+        """Return photo/embedding counts used to choose fast or fallback search."""
+
+        self.cursor.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE d.photo_path IS NOT NULL
+                    AND TRIM(CAST(d.photo_path AS TEXT)) <> ''
+                ) AS total_photos,
+                COUNT(e.employee_id) FILTER (
+                    WHERE d.photo_path IS NOT NULL
+                    AND TRIM(CAST(d.photo_path AS TEXT)) <> ''
+                    AND e.photo_path = d.photo_path
+                    AND e.embedding_dimension = 512
+                ) AS ready_embeddings
+            FROM demodataset d
+            LEFT JOIN identity_face_embeddings e
+                ON e.employee_id = d.employee_id
+            """
+        )
+        row = self.cursor.fetchone() or (0, 0)
+
+        return {
+            "total_photos": int(row[0] or 0),
+            "ready_embeddings": int(row[1] or 0),
+            "complete": bool(row[0] and row[0] == row[1])
+        }
     def get_identities_with_photos(self):
         """Return all identities that can participate in face search."""
 
@@ -3484,6 +3692,10 @@ class DatabaseService:
 
             raise ValueError(f"Identity not found: {employee_id}")
 
+        self.cursor.execute(
+            "DELETE FROM identity_face_embeddings WHERE employee_id = %s",
+            (employee_id,)
+        )
         self.cursor.execute(
             """
             DELETE FROM demodataset

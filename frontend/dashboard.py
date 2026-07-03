@@ -34,6 +34,7 @@ NEWS_TOP_CLUSTERS_URL = "http://127.0.0.1:8000/api/v1/news/clusters/top"
 NEWS_SEARCH_URL = "http://127.0.0.1:8000/api/v1/news/search"
 NEWS_TOPICS_URL = "http://127.0.0.1:8000/api/v1/news/topics"
 NEWS_CLUSTER_URL = "http://127.0.0.1:8000/api/v1/news/clusters"
+NEWS_SYNC_STATUS_URL = "http://127.0.0.1:8000/api/v1/news/sync-status/latest"
 
 
 st.set_page_config(
@@ -994,6 +995,7 @@ st.markdown(
 SEARCH_OPTIONS = {
     "Full Name": "full_name",
     "Username": "username",
+    "Face Image": "face_image",
     "DOB": "date_of_birth",
     "Aadhaar Number": "aadhar_number",
     "PAN Number": "pan_number",
@@ -3331,6 +3333,7 @@ def clear_identity_search_widget_state(row_id):
 
     st.session_state.pop(f"identity_search_field_{row_id}", None)
     st.session_state.pop(f"identity_search_value_{row_id}", None)
+    st.session_state.pop(f"identity_search_face_{row_id}", None)
     st.session_state.pop(f"remove_identity_search_row_{row_id}", None)
 
 
@@ -3339,12 +3342,15 @@ def validate_identity_search_rows(search_rows):
 
     criteria = []
     errors = []
+    face_image_count = 0
 
     for index, row in enumerate(search_rows or [], start=1):
         label = row.get("field") or f"Field {index}"
         field = SEARCH_OPTIONS.get(label)
         value = str(row.get("value") or "").strip()
 
+        if field == "face_image":
+            face_image_count += 1
         if not value:
             errors.append(f"{label} is blank. Please fill the field or remove it.")
             continue
@@ -3370,11 +3376,13 @@ def validate_identity_search_rows(search_rows):
                 }
             )
 
+    if face_image_count > 1:
+        errors.append("Add only one Face Image field per identity search.")
+
     return criteria, errors
 
-
-def build_osint_approval_items(criteria):
-    """Build editable OSINT preview items from every filled search criterion."""
+def build_osint_approval_items(criteria, face_upload=None):
+    """Build editable OSINT preview items from filled text and image criteria."""
 
     items = []
     seen_values = set()
@@ -3386,18 +3394,32 @@ def build_osint_approval_items(criteria):
         if field not in OSINT_ELIGIBLE_FIELDS or not value:
             continue
 
-        if value in seen_values:
+        deduplication_key = (field, value)
+
+        if deduplication_key in seen_values:
             continue
 
-        seen_values.add(value)
-        items.append(
-            {
-                "id": uuid.uuid4().hex,
-                "field": field,
-                "label": OSINT_FIELD_LABELS.get(field, field),
-                "value": value
-            }
-        )
+        seen_values.add(deduplication_key)
+        approval_item = {
+            "id": uuid.uuid4().hex,
+            "field": field,
+            "label": OSINT_FIELD_LABELS.get(field, field),
+            "value": value
+        }
+
+        if field == "face_image":
+            if face_upload is None:
+                continue
+
+            approval_item.update(
+                {
+                    "filename": face_upload.name,
+                    "content_type": face_upload.type or "application/octet-stream",
+                    "file_bytes": face_upload.getvalue()
+                }
+            )
+
+        items.append(approval_item)
 
     return items
 
@@ -3439,6 +3461,13 @@ def render_osint_approval_panel():
                 key=f"osint_preview_value_{item_id}"
             )
 
+            if item.get("field") == "face_image" and item.get("file_bytes"):
+                st.image(
+                    item.get("file_bytes"),
+                    width=170,
+                    caption="Approved face image preview"
+                )
+
         with remove_col:
             st.write("")
             if st.button(
@@ -3467,6 +3496,25 @@ def render_osint_approval_panel():
             status_panel("Select at least one OSINT item before submitting.", "danger")
             return
 
+        approved_face_item = next(
+            (
+                item
+                for item in pending_items
+                if item.get("field") == "face_image"
+            ),
+            None
+        )
+        request_files = None
+
+        if approved_face_item:
+            request_files = {
+                "face_image": (
+                    approved_face_item.get("filename") or "face_image.jpg",
+                    approved_face_item.get("file_bytes") or b"",
+                    approved_face_item.get("content_type") or "application/octet-stream"
+                )
+            }
+
         response, result = post_request(
             OSINT_SUBMIT_URL,
             data={
@@ -3479,7 +3527,8 @@ def render_osint_approval_panel():
                         for item in pending_items
                     ]
                 )
-            }
+            },
+            files=request_files
         )
 
         if response is None or response.status_code != 200:
@@ -3836,6 +3885,83 @@ def execute_news_search(query_text):
         status_panel("No news results matched this search.", "warning")
 
 
+def build_news_data_signature(status_payload):
+    """Build a stable change marker from the latest webhook and Docker DB state."""
+
+    status_payload = status_payload or {}
+    latest_batch = status_payload.get("latest_batch") or {}
+    live_snapshot = status_payload.get("live_snapshot") or {}
+
+    signature_payload = {
+        "batch_id": latest_batch.get("batch_id"),
+        "batch_status": latest_batch.get("status"),
+        "batch_updated_at": latest_batch.get("updated_at"),
+        "engine_completed_at": latest_batch.get("engine_completed_at"),
+        "snapshot": {
+            "clusters": live_snapshot.get("clusters"),
+            "articles": live_snapshot.get("articles"),
+            "cluster_entities": live_snapshot.get("cluster_entities"),
+            "article_entities": live_snapshot.get("article_entities"),
+            "latest_cluster_update": live_snapshot.get("latest_cluster_update"),
+            "latest_article_published": live_snapshot.get("latest_article_published")
+        }
+    }
+
+    return json.dumps(
+        signature_payload,
+        sort_keys=True,
+        default=str
+    )
+
+
+@st.fragment(run_every="10s")
+def render_news_auto_refresh_monitor():
+    """Refresh News Intelligence when a webhook or Docker DB snapshot changes."""
+
+    response, result = get_request(
+        NEWS_SYNC_STATUS_URL,
+        params={
+            "include_live_snapshot": "true"
+        }
+    )
+
+    if response is None or response.status_code != 200:
+        st.caption("Automatic news updates are temporarily unavailable.")
+        return
+
+    current_signature = build_news_data_signature(result)
+    previous_signature = st.session_state.get("news_data_signature")
+    st.session_state["news_data_signature"] = current_signature
+
+    if previous_signature is not None and current_signature != previous_signature:
+        st.session_state.pop("news_common_topics_cache", None)
+        st.session_state.pop("news_search_result", None)
+        st.session_state.pop("selected_news_cluster_id", None)
+        st.session_state["news_auto_refresh_message"] = (
+            "New News Intelligence data was detected and loaded automatically."
+        )
+        st.rerun(scope="app")
+
+    latest_batch = result.get("latest_batch") or {}
+    snapshot_status = result.get("snapshot_status")
+    batch_text = (
+        f" Latest batch: {latest_batch.get('batch_id')} "
+        f"({str(latest_batch.get('status') or '-').lower()})."
+        if latest_batch.get("batch_id")
+        else ""
+    )
+
+    if snapshot_status == "available":
+        st.caption(f"Automatic news updates are active.{batch_text}")
+    elif snapshot_status == "unavailable":
+        st.caption(
+            "Webhook updates are active. Docker PostgreSQL is temporarily unavailable."
+            f"{batch_text}"
+        )
+    else:
+        st.caption(f"Webhook updates are active.{batch_text}")
+
+
 render_header()
 
 selected_dashboard_section = render_sidebar_navigation()
@@ -3910,12 +4036,21 @@ if selected_dashboard_section == "Identity Search":
             )
 
         with value_col:
-            search_value = st.text_input(
-                f"Value {index + 1}",
-                value=row.get("value", ""),
-                placeholder=f"Enter {selected_label}",
-                key=f"identity_search_value_{row_id}"
-            )
+            if selected_label == "Face Image":
+                identity_face_upload = st.file_uploader(
+                    f"Value {index + 1}",
+                    type=["jpg", "jpeg", "png"],
+                    key=f"identity_search_face_{row_id}",
+                    help="Upload one clear face image for database and approved OSINT search."
+                )
+                search_value = identity_face_upload.name if identity_face_upload else ""
+            else:
+                search_value = st.text_input(
+                    f"Value {index + 1}",
+                    value=row.get("value", ""),
+                    placeholder=f"Enter {selected_label}",
+                    key=f"identity_search_value_{row_id}"
+                )
 
         with remove_col:
             st.write("")
@@ -3950,6 +4085,22 @@ if selected_dashboard_section == "Identity Search":
         criteria, validation_errors = validate_identity_search_rows(
             st.session_state.identity_search_rows
         )
+        text_criteria = [
+            item
+            for item in criteria
+            if item.get("field") != "face_image"
+        ]
+        face_rows = [
+            row
+            for row in st.session_state.identity_search_rows
+            if SEARCH_OPTIONS.get(row.get("field")) == "face_image"
+        ]
+        face_upload = None
+
+        if face_rows:
+            face_upload = st.session_state.get(
+                f"identity_search_face_{face_rows[0].get('id')}"
+            )
 
         if validation_errors:
             for error in validation_errors:
@@ -3957,34 +4108,71 @@ if selected_dashboard_section == "Identity Search":
         elif not criteria:
             status_panel("Please enter at least one search value.", "danger")
         else:
-            with st.spinner("Searching database records..."):
-                response, result = post_request(
-                    ADVANCED_SEARCH_URL,
-                    data={
-                        "criteria_json": json.dumps(criteria),
-                        "submit_osint": "false"
-                    }
-                )
-
-            if response is None or response.status_code != 200:
-                status_panel(result.get("message", "Search failed."), "danger")
-            else:
-                st.session_state["identity_search_result"] = {
-                    "total_matches": result.get("total_matches", 0),
-                    "results": result.get("results", [])
-                }
-                st.session_state["identity_search_page_number"] = 1
-                st.session_state["identity_search_page_select"] = 1
-                st.session_state["pending_osint_items"] = build_osint_approval_items(criteria)
-
-                if not st.session_state["pending_osint_items"]:
-                    status_panel(
-                        "No filled search fields were available to send to OSINT.",
-                        "warning"
+            if text_criteria:
+                with st.spinner("Searching database records..."):
+                    response, result = post_request(
+                        ADVANCED_SEARCH_URL,
+                        data={
+                            "criteria_json": json.dumps(text_criteria),
+                            "submit_osint": "false"
+                        }
                     )
+
+                if response is None or response.status_code != 200:
+                    status_panel(result.get("message", "Search failed."), "danger")
+                else:
+                    st.session_state["identity_search_result"] = {
+                        "total_matches": result.get("total_matches", 0),
+                        "results": result.get("results", [])
+                    }
+                    st.session_state["identity_search_page_number"] = 1
+                    st.session_state["identity_search_page_select"] = 1
+
+            if face_upload is not None:
+                with st.spinner("Queueing face search..."):
+                    face_response, face_result = post_request(
+                        FACE_SEARCH_JOBS_URL,
+                        files=uploaded_file_payload("image", face_upload),
+                        timeout=120
+                    )
+
+                if face_response is None or face_response.status_code != 200:
+                    status_panel(
+                        face_result.get("message", "Face search could not be queued."),
+                        "danger"
+                    )
+                else:
+                    face_job = face_result.get("job") or {}
+                    st.session_state["active_face_search_job_id"] = face_job.get("job_id")
+                    st.session_state["active_face_search_job"] = face_job
+                    st.session_state.pop("last_face_search_job", None)
+                    status_panel(
+                        f"Face search queued successfully. Job ID: {face_job.get('job_id')}",
+                        "success"
+                    )
+
+            st.session_state["pending_osint_items"] = build_osint_approval_items(
+                criteria,
+                face_upload=face_upload
+            )
+
+            if not st.session_state["pending_osint_items"]:
+                status_panel(
+                    "No filled search fields were available to send to OSINT.",
+                    "warning"
+                )
 
     if st.session_state.get("identity_search_result"):
         render_identity_search_results(st.session_state.get("identity_search_result"))
+
+    if st.session_state.get("active_face_search_job_id"):
+        render_face_search_job_status(
+            st.session_state.get("active_face_search_job_id")
+        )
+    elif st.session_state.get("last_face_search_job"):
+        render_face_search_job_card(
+            st.session_state.get("last_face_search_job")
+        )
 
     render_osint_approval_panel()
     render_osint_job_lookup_panel()
@@ -4009,6 +4197,16 @@ if selected_dashboard_section == "News Intelligence":
         """,
         unsafe_allow_html=True
     )
+
+    render_news_auto_refresh_monitor()
+
+    news_auto_refresh_message = st.session_state.pop(
+        "news_auto_refresh_message",
+        None
+    )
+
+    if news_auto_refresh_message:
+        status_panel(news_auto_refresh_message, "success")
 
     if st.session_state.pop("news_intelligence_reset_requested", False):
         st.session_state["news_search_query"] = ""
@@ -4099,11 +4297,18 @@ if selected_dashboard_section == "News Intelligence":
     if news_search_clicked:
         execute_news_search(news_query)
 
-    with st.spinner("Loading top news..."):
+    news_cluster_limit = st.selectbox(
+        "Latest news to display",
+        [10, 20, 30, 40, 50],
+        index=0,
+        key="news_cluster_display_limit"
+    )
+
+    with st.spinner("Loading latest news..."):
         top_response, top_result = get_request(
             NEWS_TOP_CLUSTERS_URL,
             params={
-                "limit": 10
+                "limit": news_cluster_limit
             }
         )
 
@@ -4135,7 +4340,10 @@ if selected_dashboard_section == "News Intelligence":
                     "search_news_cluster"
                 )
 
-        st.markdown('<div class="section-title">Top 10 News</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">Latest {news_cluster_limit} News</div>',
+            unsafe_allow_html=True
+        )
 
         if not top_clusters:
             status_panel("No news records were found in the news database.", "warning")

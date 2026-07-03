@@ -6,6 +6,7 @@ Longer operations such as OSINT submission are pushed into FastAPI background
 tasks while the final OSINT payload returns through the webhook endpoint.
 """
 
+import base64
 import hmac
 import io
 import json
@@ -248,7 +249,8 @@ OSINT_ALLOWED_TARGET_FIELDS = {
     "email",
     "employee_id",
     "department",
-    "state"
+    "state",
+    "face_image"
 }
 
 
@@ -261,6 +263,10 @@ def osint_targets_from_criteria(criteria):
 
         field = str(item.get("field") or "").strip()
         value = str(item.get("value") or "").strip()
+
+        if field == "face_image":
+
+            continue
 
         normalized_field = "phone_number" if field == "phone" else field
         target = {
@@ -320,7 +326,81 @@ def validate_identity_search_value(
         raise ValueError("Username can contain only letters, numbers, @, #, dot, and underscore")
 
 
-def normalize_osint_items(items):
+async def build_osint_face_target(uploaded_file):
+    """Validate one approved face image and encode it for the OSINT JSON API."""
+
+    if uploaded_file is None:
+
+        return None
+
+    image_bytes = await uploaded_file.read()
+
+    if not image_bytes:
+
+        raise ValueError("Approved Face Image is empty")
+
+    if len(image_bytes) > settings.OSINT_FACE_IMAGE_MAX_BYTES:
+
+        maximum_mb = settings.OSINT_FACE_IMAGE_MAX_BYTES / (1024 * 1024)
+        raise ValueError(
+            f"Face Image exceeds the {maximum_mb:.1f} MB OSINT upload limit"
+        )
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image_format = str(image.format or "").upper()
+            image.verify()
+    except (UnidentifiedImageError, OSError) as error:
+        raise ValueError("Face Image must be a valid JPG, JPEG, or PNG file") from error
+
+    content_types = {
+        "JPEG": "image/jpeg",
+        "PNG": "image/png"
+    }
+
+    if image_format not in content_types:
+
+        raise ValueError("Face Image must be a valid JPG, JPEG, or PNG file")
+
+    safe_filename = os.path.basename(
+        uploaded_file.filename or f"face_image.{image_format.lower()}"
+    )
+
+    return {
+        "key": "face_image",
+        "value": {
+            "filename": safe_filename,
+            "content_type": content_types[image_format],
+            "encoding": "base64",
+            "size_bytes": len(image_bytes),
+            "base64_data": base64.b64encode(image_bytes).decode("ascii")
+        }
+    }
+
+
+def osint_targets_for_storage(targets):
+    """Remove image bytes while retaining useful OSINT job audit metadata."""
+
+    stored_targets = []
+
+    for target in targets or []:
+        stored_target = dict(target)
+        value = stored_target.get("value")
+
+        if stored_target.get("key") == "face_image" and isinstance(value, dict):
+            stored_target["value"] = {
+                key: item
+                for key, item in value.items()
+                if key != "base64_data"
+            }
+            stored_target["value"]["image_attached"] = True
+
+        stored_targets.append(stored_target)
+
+    return stored_targets
+
+
+def normalize_osint_items(items, face_target=None):
     """Validate approved OSINT items and return provider key/value targets."""
 
     targets = []
@@ -346,11 +426,21 @@ def normalize_osint_items(items):
             value
         )
 
-        normalized_field = "phone_number" if field == "phone" else field
-        target = {
-            "key": normalized_field,
-            "value": value
-        }
+        if field == "face_image":
+
+            if not face_target:
+
+                raise ValueError("Approved Face Image file was not uploaded")
+
+            target = face_target
+
+        else:
+
+            normalized_field = "phone_number" if field == "phone" else field
+            target = {
+                "key": normalized_field,
+                "value": value
+            }
 
         if target not in targets:
 
@@ -547,6 +637,50 @@ def submit_osint_job_background(
         )
 
 
+def sync_identity_face_embedding(
+    employee_id,
+    photo_path
+):
+    """Generate and persist one identity embedding after a photo change."""
+
+    sync_database_service = DatabaseService()
+
+    try:
+        resolved_photo_path = face_service.resolve_database_photo_path(photo_path)
+        photo_hash = face_service.photo_fingerprint(resolved_photo_path)
+        embedding_payload = face_service.extract_external_embedding(
+            resolved_photo_path
+        )
+        sync_database_service.upsert_face_embedding(
+            employee_id=employee_id,
+            photo_path=photo_path,
+            photo_hash=photo_hash,
+            model_name=(
+                embedding_payload.get("model_name")
+                or settings.FACE_EMBEDDING_MODEL
+            ),
+            embedding=embedding_payload.get("embedding"),
+            face_quality=embedding_payload.get("quality"),
+            detection_score=embedding_payload.get("det_score")
+        )
+        logger.info(
+            "Identity face embedding stored: employee_id=%s model=%s",
+            employee_id,
+            embedding_payload.get("model_name")
+        )
+
+    except Exception:
+        sync_database_service.delete_face_embedding(employee_id)
+        logger.exception(
+            "Identity face embedding sync failed: employee_id=%s photo_path=%s",
+            employee_id,
+            photo_path
+        )
+
+    finally:
+        sync_database_service.close()
+
+
 def run_face_search_job_background(
     job_id,
     uploaded_image_path
@@ -563,10 +697,21 @@ def run_face_search_job_background(
     try:
 
         database_people = background_database_service.get_identities_with_photos()
+        embedding_coverage = background_database_service.get_face_embedding_coverage()
+        embedding_candidates = None
+
+        if embedding_coverage.get("complete"):
+            embedding_candidates = (
+                background_database_service.get_identity_face_embedding_candidates()
+            )
+
         logger.info(
-            "Face search background candidates loaded: job_id=%s total_candidates=%s",
+            "Face search background candidates loaded: job_id=%s total_candidates=%s "
+            "ready_embeddings=%s vector_search_enabled=%s",
             job_id,
-            len(database_people)
+            len(database_people),
+            embedding_coverage.get("ready_embeddings"),
+            bool(embedding_candidates)
         )
         background_database_service.mark_face_search_job_processing(
             job_id,
@@ -575,11 +720,16 @@ def run_face_search_job_background(
         background_database_service.update_face_search_job_progress(
             job_id,
             50,
-            "Face comparison is running. This can take a few minutes."
+            (
+                "Searching persistent InsightFace embeddings."
+                if embedding_candidates
+                else "Face comparison is running. Embedding backfill is incomplete."
+            )
         )
         face_search_result = face_service.find_best_database_match(
             uploaded_image_path,
-            database_people
+            database_people,
+            embedding_candidates=embedding_candidates
         )
         payload = {
             "status": "success",
@@ -989,7 +1139,9 @@ async def submit_approved_osint_job(
 
     background_tasks: BackgroundTasks,
 
-    targets_json: str = Form(...)
+    targets_json: str = Form(...),
+
+    face_image: UploadFile = File(None)
 
 ):
     """Create an OSINT job only after the dashboard user approves targets."""
@@ -1006,13 +1158,27 @@ async def submit_approved_osint_job(
 
             raise ValueError("OSINT targets must be a list")
 
-        osint_targets = normalize_osint_items(items)
+        has_face_item = any(
+            str(item.get("field") or "").strip() == "face_image"
+            for item in items
+            if isinstance(item, dict)
+        )
+
+        if face_image is not None and not has_face_item:
+
+            raise ValueError("Face Image file was provided without an approved face_image target")
+
+        face_target = await build_osint_face_target(face_image) if has_face_item else None
+        osint_targets = normalize_osint_items(
+            items,
+            face_target=face_target
+        )
         logger.info(
             "Approved OSINT job creation requested: total_targets=%s",
             len(osint_targets)
         )
         osint_job = database_service.create_osint_job(
-            targets=osint_targets
+            targets=osint_targets_for_storage(osint_targets)
         )
         job_id = osint_job.get("job_id")
         logger.info(
@@ -1403,6 +1569,12 @@ async def verify_osint_avatars(
             profiles = approved_avatars
 
         database_people = request_database_service.get_identities_with_photos()
+        embedding_coverage = request_database_service.get_face_embedding_coverage()
+        embedding_candidates = (
+            request_database_service.get_identity_face_embedding_candidates()
+            if embedding_coverage.get("complete")
+            else None
+        )
         verification_rows = []
 
         for profile in profiles:
@@ -1429,7 +1601,8 @@ async def verify_osint_avatars(
 
             face_result = face_service.find_best_database_match(
                 avatar_path,
-                database_people
+                database_people,
+                embedding_candidates=embedding_candidates
             )
             verification_rows.append(
                 {
@@ -1751,16 +1924,35 @@ async def get_latest_news_sync_status(
         request_database_service = DatabaseService()
         event = request_database_service.get_latest_news_ingestion_event()
         live_snapshot = None
+        snapshot_status = "not_requested"
+        snapshot_error = None
 
-        if include_live_snapshot and NewsDatabaseService.is_configured():
-            remote_news_database_service = NewsDatabaseService()
-            live_snapshot = remote_news_database_service.get_data_snapshot()
+        if include_live_snapshot:
+
+            if NewsDatabaseService.is_configured():
+
+                try:
+                    remote_news_database_service = NewsDatabaseService()
+                    live_snapshot = remote_news_database_service.get_data_snapshot()
+                    snapshot_status = "available"
+                except Exception as error:
+                    snapshot_status = "unavailable"
+                    snapshot_error = str(error)
+                    logger.warning(
+                        "Latest news live snapshot unavailable: %s",
+                        error
+                    )
+
+            else:
+                snapshot_status = "not_configured"
 
         return JSONResponse(
             content={
                 "status": "success",
                 "latest_batch": event,
-                "live_snapshot": live_snapshot
+                "live_snapshot": live_snapshot,
+                "snapshot_status": snapshot_status,
+                "snapshot_error": snapshot_error
             }
         )
 
@@ -2520,6 +2712,8 @@ async def admin_get_identity(
 @app.post("/admin/identities")
 async def admin_create_identity(
 
+    background_tasks: BackgroundTasks,
+
     employee_id: str = Form(...),
 
     full_name: str = Form(...),
@@ -2578,6 +2772,12 @@ async def admin_create_identity(
             }
         )
 
+        if photo_path:
+            background_tasks.add_task(
+                sync_identity_face_embedding,
+                created_identity.get("employee_id"),
+                created_identity.get("photo_path")
+            )
         return JSONResponse(
 
             content={
@@ -2627,6 +2827,8 @@ async def admin_create_identity(
 async def admin_update_identity(
 
     employee_id: str,
+
+    background_tasks: BackgroundTasks,
 
     full_name: str = Form(...),
 
@@ -2684,6 +2886,12 @@ async def admin_update_identity(
             }
         )
 
+        if photo_path:
+            background_tasks.add_task(
+                sync_identity_face_embedding,
+                updated_identity.get("employee_id"),
+                updated_identity.get("photo_path")
+            )
         return JSONResponse(
 
             content={
@@ -2929,6 +3137,12 @@ async def search_by_face(
         logger.info("Face search image saved: path=%s", saved_file_path)
 
         database_people = database_service.get_identities_with_photos()
+        embedding_coverage = database_service.get_face_embedding_coverage()
+        embedding_candidates = (
+            database_service.get_identity_face_embedding_candidates()
+            if embedding_coverage.get("complete")
+            else None
+        )
 
         logger.info(
             "Face search database candidates loaded: total_candidates=%s",
@@ -2937,7 +3151,8 @@ async def search_by_face(
 
         face_search_result = face_service.find_best_database_match(
             saved_file_path,
-            database_people
+            database_people,
+            embedding_candidates=embedding_candidates
         )
 
         logger.info(
@@ -3002,6 +3217,8 @@ async def search_by_face(
 
 @app.post("/register-identity")
 async def register_identity(
+
+    background_tasks: BackgroundTasks,
 
     employee_id: str = Form(...),
 
@@ -3070,6 +3287,11 @@ async def register_identity(
             }
         )
 
+        background_tasks.add_task(
+            sync_identity_face_embedding,
+            registered_user.get("employee_id"),
+            registered_user.get("photo_path")
+        )
         logger.info(
             "Identity registration completed: employee_id=%s",
             registered_user.get("employee_id")
