@@ -7,6 +7,7 @@ from functools import lru_cache
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 
 
 FACE_ENGINE_MODEL = os.environ.get(
@@ -271,6 +272,180 @@ def embedding_payload(image_path, assume_cropped=False):
         "extraction_method": extracted["extraction_method"]
     }
 
+
+def _safe_file_part(value):
+    """Keep generated crop filenames readable and filesystem-safe."""
+
+    return "".join(
+        character if character.isalnum() or character in {"_", "-"} else "_"
+        for character in str(value or "face")
+    ).strip("_") or "face"
+
+
+def _square_padded_crop(image, bbox, padding_ratio=0.22):
+    """Crop one face as a padded square so dashboard thumbnails look stable."""
+
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = [float(value) for value in bbox]
+    face_width = max(1.0, x2 - x1)
+    face_height = max(1.0, y2 - y1)
+    center_x = x1 + face_width / 2.0
+    center_y = y1 + face_height / 2.0
+    side = max(face_width, face_height) * (1.0 + padding_ratio)
+    crop_x1 = max(0, int(round(center_x - side / 2.0)))
+    crop_y1 = max(0, int(round(center_y - side / 2.0)))
+    crop_x2 = min(width, int(round(center_x + side / 2.0)))
+    crop_y2 = min(height, int(round(center_y + side / 2.0)))
+
+    if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+
+        raise ValueError("Invalid face crop bounds")
+
+    return image[crop_y1:crop_y2, crop_x1:crop_x2]
+
+
+
+
+def _aligned_face_crop(image, face, fallback_bbox, image_size=256):
+    """Use InsightFace landmarks for a centered, pose-normalized face crop."""
+
+    keypoints = getattr(face, "kps", None)
+
+    if keypoints is not None:
+        try:
+            aligned_crop = face_align.norm_crop(
+                image,
+                landmark=keypoints,
+                image_size=image_size
+            )
+
+            if aligned_crop is not None and aligned_crop.size > 0:
+
+                return aligned_crop, "insightface_landmark_aligned"
+
+        except Exception:
+            pass
+
+    return _square_padded_crop(
+        image,
+        fallback_bbox
+    ), "bbox_square_fallback"
+def _enhance_face_crop(crop):
+    """Keep a detected face crop natural while making tiny crops reviewable."""
+
+    if crop is None or crop.size == 0:
+
+        raise ValueError("Cannot enhance an empty face crop")
+
+    enhanced = crop.copy()
+    height, width = enhanced.shape[:2]
+    min_side = min(height, width)
+
+    if min_side < 224:
+        scale = min(
+            2.5,
+            max(1.0, 224.0 / max(1, min_side))
+        )
+        enhanced = cv2.resize(
+            enhanced,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+    gray_image = cv2.cvtColor(
+        enhanced,
+        cv2.COLOR_BGR2GRAY
+    )
+    brightness = float(np.mean(gray_image))
+
+    if brightness < 65 or brightness > 195:
+        lab_image = cv2.cvtColor(
+            enhanced,
+            cv2.COLOR_BGR2LAB
+        )
+        lightness, channel_a, channel_b = cv2.split(lab_image)
+        clahe = cv2.createCLAHE(
+            clipLimit=1.2,
+            tileGridSize=(8, 8)
+        )
+        lightness = clahe.apply(lightness)
+        enhanced = cv2.cvtColor(
+            cv2.merge((lightness, channel_a, channel_b)),
+            cv2.COLOR_LAB2BGR
+        )
+
+    enhanced = cv2.fastNlMeansDenoisingColored(
+        enhanced,
+        None,
+        1,
+        1,
+        5,
+        15
+    )
+
+    return enhanced
+
+def detect_faces_payload(image_path, output_dir, output_prefix):
+    """Detect all faces in one frame, save crops, and return embeddings."""
+
+    image = load_image(image_path)
+    app = load_face_app()
+    faces = app.get(image)
+    os.makedirs(output_dir, exist_ok=True)
+    safe_prefix = _safe_file_part(output_prefix)
+    detected_faces = []
+
+    for face_index, face in enumerate(faces, start=1):
+
+        embedding = np.asarray(
+            face.normed_embedding,
+            dtype=np.float32
+        )
+        embedding_norm = float(np.linalg.norm(embedding))
+
+        if embedding_norm <= 0:
+
+            continue
+
+        embedding = embedding / embedding_norm
+        bbox = [
+            round(float(value), 2)
+            for value in face.bbox
+        ]
+        crop, crop_method = _aligned_face_crop(
+            image,
+            face,
+            bbox
+        )
+        enhanced_crop = _enhance_face_crop(crop)
+        crop_filename = f"{safe_prefix}_face_{face_index}.jpg"
+        crop_path = os.path.abspath(
+            os.path.join(
+                output_dir,
+                crop_filename
+            )
+        )
+        cv2.imwrite(
+            crop_path,
+            enhanced_crop,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        )
+        detected_faces.append(
+            {
+                "face_image_path": crop_path,
+                "bbox": bbox,
+                "det_score": round(float(face.det_score), 4),
+                "embedding": embedding.tolist(),
+                "quality": image_quality(enhanced_crop),
+                "enhanced": True,
+                "crop_method": crop_method,
+                "model_name": FACE_ENGINE_MODEL
+            }
+        )
+
+    return detected_faces
 def cosine_similarity(
     embedding_one,
     embedding_two

@@ -33,6 +33,7 @@ try:
     from ..services.database_service import DatabaseService
     from ..services.decision_service import DecisionService
     from ..services.document_verification_service import DocumentVerificationService
+    from ..services.drishti_service import DrishtiService
     from ..services.file_service import FileService
     from ..services.face_service import FaceVerificationService
     from ..services.ocr_service import OCRService
@@ -40,11 +41,13 @@ try:
     from ..services.osint_service import OSINTService
     from ..services.news_database_service import NewsDatabaseService
     from ..services.risk_service import RiskScoringService
+    from ..services.video_face_service import VideoFaceProcessingService
 except ImportError:
     from config import settings
     from services.database_service import DatabaseService
     from services.decision_service import DecisionService
     from services.document_verification_service import DocumentVerificationService
+    from services.drishti_service import DrishtiService
     from services.file_service import FileService
     from services.face_service import FaceVerificationService
     from services.ocr_service import OCRService
@@ -52,6 +55,7 @@ except ImportError:
     from services.osint_service import OSINTService
     from services.news_database_service import NewsDatabaseService
     from services.risk_service import RiskScoringService
+    from services.video_face_service import VideoFaceProcessingService
 
 from utils.logger import configure_logging
 from utils.logger import get_logger
@@ -69,6 +73,7 @@ ocr_service = OCRService()
 osint_normalizer_service = OSINTNormalizerService()
 osint_service = OSINTService()
 risk_service = RiskScoringService()
+video_face_service = VideoFaceProcessingService()
 document_verification_service = DocumentVerificationService(
     file_service,
     ocr_service,
@@ -77,6 +82,7 @@ document_verification_service = DocumentVerificationService(
     risk_service,
     decision_service
 )
+drishti_service = DrishtiService(database_service)
 
 
 def database_health_payload():
@@ -232,6 +238,46 @@ def execute_news_database_operation(operation_name, callback):
     finally:
         if should_close:
             news_database_service.close()
+
+
+async def save_video_upload(video):
+    """Persist an uploaded video file under backend/uploads/videos."""
+
+    allowed_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    original_filename = video.filename or "uploaded_video.mp4"
+    extension = os.path.splitext(original_filename)[1].lower()
+
+    if extension not in allowed_extensions:
+
+        raise ValueError("Only MP4, AVI, MOV, MKV, and WEBM video uploads are supported")
+
+    video_dir = os.path.join(
+        settings.BACKEND_ROOT,
+        "uploads",
+        "videos"
+    )
+    os.makedirs(video_dir, exist_ok=True)
+    safe_name = re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        os.path.splitext(original_filename)[0]
+    ).strip("_") or "video"
+    saved_path = os.path.abspath(
+        os.path.join(
+            video_dir,
+            f"{uuid4().hex}_{safe_name}{extension}"
+        )
+    )
+    content = await video.read()
+
+    if not content:
+
+        raise ValueError("Uploaded video is empty")
+
+    with open(saved_path, "wb") as video_file:
+        video_file.write(content)
+
+    return saved_path
 
 """Helper functions for validating and normalizing identity search criteria and OSINT targets."""
 
@@ -774,6 +820,103 @@ def run_face_search_job_background(
 
 
 
+
+def run_video_face_search_job_background(
+    job_id,
+    uploaded_video_path
+):
+    """Execute one incremental video face-search job with a fresh DB connection."""
+
+    logger.info(
+        "Video face background task started: job_id=%s video_path=%s",
+        job_id,
+        uploaded_video_path
+    )
+    background_database_service = DatabaseService()
+
+    try:
+        video_face_service.process_job(
+            job_id,
+            uploaded_video_path,
+            background_database_service,
+            face_service
+        )
+
+    except Exception as error:
+        logger.exception(
+            "Video face background task failed: job_id=%s",
+            job_id
+        )
+        background_database_service.mark_video_face_job_failed(
+            job_id,
+            str(error)
+        )
+
+    finally:
+        background_database_service.close()
+        logger.info(
+            "Video face background task finished: job_id=%s",
+            job_id
+        )
+
+def run_video_face_verification_background(
+    job_id,
+    face_ids
+):
+    """Verify reviewer-selected video face crops against database identities."""
+
+    logger.info(
+        "Video face verification background task started: job_id=%s face_ids=%s",
+        job_id,
+        face_ids
+    )
+    background_database_service = DatabaseService()
+
+    try:
+        selected_faces = background_database_service.get_video_detected_faces_by_ids(
+            job_id,
+            face_ids
+        )
+        database_people = background_database_service.get_identities_with_photos()
+        embedding_coverage = background_database_service.get_face_embedding_coverage()
+        embedding_candidates = None
+
+        if embedding_coverage.get("complete"):
+            embedding_candidates = background_database_service.get_identity_face_embedding_candidates()
+
+        for detected_face in selected_faces:
+            match_result = face_service.find_best_database_match(
+                detected_face.get("face_image_path"),
+                database_people,
+                embedding_candidates=embedding_candidates
+            )
+            background_database_service.update_video_detected_face_match(
+                detected_face.get("face_id"),
+                match_result
+            )
+            logger.info(
+                "Selected video face verified: job_id=%s face_id=%s matched=%s employee_id=%s score=%s",
+                job_id,
+                detected_face.get("face_id"),
+                match_result.get("matched"),
+                (match_result.get("best_match") or {}).get("employee_id"),
+                match_result.get("best_score")
+            )
+
+    except Exception:
+        logger.exception(
+            "Video face verification background task failed: job_id=%s face_ids=%s",
+            job_id,
+            face_ids
+        )
+
+    finally:
+        background_database_service.close()
+        logger.info(
+            "Video face verification background task finished: job_id=%s face_ids=%s",
+            job_id,
+            face_ids
+        )
 def run_document_validation_job_background(
     job_id,
     document_type,
@@ -852,58 +995,6 @@ def home():
     return {
         "message": "Identity Search API Running"
     }
-
-
-@app.get("/health")
-def health():
-    """Return a lightweight API-only health response."""
-
-    return {
-        "status": "ok",
-        "service": "identity-search-service",
-        "message": "Backend API is running"
-    }
-
-
-@app.get("/health/db")
-def health_db():
-    """Return PostgreSQL connectivity health."""
-
-    payload, status_code = database_health_payload()
-
-    return JSONResponse(
-        status_code=status_code,
-        content=payload
-    )
-
-
-@app.get("/health/osint")
-def health_osint(
-
-    check_network: bool = Query(False)
-
-):
-    """Return OSINT config health and optional network reachability."""
-
-    payload, status_code = osint_health_payload(check_network)
-
-    return JSONResponse(
-        status_code=status_code,
-        content=payload
-    )
-
-
-@app.get(settings.NEWS_HEALTH_PATH)
-def health_news_database():
-    """Return optional external news database connectivity health."""
-
-    payload, status_code = news_database_health_payload()
-
-    return JSONResponse(
-        status_code=status_code,
-        content=payload
-    )
-
 
 @app.get("/health/full")
 def health_full(
@@ -1045,7 +1136,7 @@ async def search_identity_advanced(
             len(criteria)
         )
 
-        results = database_service.search_identity_multi(criteria)
+        results = database_service.search_identity(criteria)
         osint_job = None
         osint_targets = osint_targets_from_criteria(criteria)
         should_submit_osint = str(submit_osint or "true").lower() in {
@@ -1235,6 +1326,219 @@ async def submit_approved_osint_job(
             }
         )
 
+
+
+@app.post("/api/v1/jobs/video-face-search")
+async def submit_video_face_search_job(
+
+    background_tasks: BackgroundTasks,
+
+    video: UploadFile = File(...)
+
+):
+    """Create an incremental video face-search job and return immediately."""
+
+    request_database_service = DatabaseService()
+
+    try:
+        logger.info(
+            "Video face async job creation requested: filename=%s",
+            video.filename
+        )
+        saved_video_path = await save_video_upload(video)
+        video_job = request_database_service.create_video_face_search_job(
+            saved_video_path,
+            video.filename
+        )
+        job_id = video_job.get("job_id")
+        background_tasks.add_task(
+            run_video_face_search_job_background,
+            job_id,
+            saved_video_path
+        )
+        logger.info(
+            "Video face async job queued: job_id=%s uploaded_video_path=%s",
+            job_id,
+            saved_video_path
+        )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": "Video face search queued successfully",
+                "job": video_job
+            }
+        )
+
+    except ValueError as e:
+        logger.exception("Video face async validation failed")
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    except Exception as e:
+        logger.exception("Video face async job submission failed")
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+        request_database_service.close()
+
+
+
+@app.post("/api/v1/jobs/video-face-search/{job_id}/verify-faces")
+async def submit_video_face_verification(
+
+    job_id: str,
+
+    background_tasks: BackgroundTasks,
+
+    payload: dict = Body(...)
+
+):
+    """Verify only the video faces selected by the dashboard user."""
+
+    request_database_service = DatabaseService()
+
+    try:
+        face_ids = [
+            int(face_id)
+            for face_id in payload.get("face_ids", [])
+        ]
+
+        if not face_ids:
+
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Please select at least one detected face for verification."
+                }
+            )
+
+        job = request_database_service.get_video_face_search_job(job_id)
+
+        if not job:
+
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": f"Video face search job not found: {job_id}"
+                }
+            )
+
+        queued_faces = request_database_service.mark_video_detected_faces_searching(
+            job_id,
+            face_ids
+        )
+
+        if not queued_faces:
+
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "No selected pending faces were available for verification."
+                }
+            )
+
+        background_tasks.add_task(
+            run_video_face_verification_background,
+            job_id,
+            [face.get("face_id") for face in queued_faces]
+        )
+        refreshed_job = request_database_service.get_video_face_search_job(job_id)
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": "Selected video faces queued for database verification.",
+                "job": refreshed_job
+            }
+        )
+
+    except ValueError:
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "face_ids must contain numeric detected face IDs."
+            }
+        )
+
+    except Exception as e:
+        logger.exception("Selected video face verification request failed: job_id=%s", job_id)
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+        request_database_service.close()
+
+@app.get("/api/v1/jobs/video-face-search/{job_id}")
+async def get_video_face_search_job(
+
+    job_id: str
+
+):
+    """Return one video face-search job plus already detected faces."""
+
+    request_database_service = DatabaseService()
+
+    try:
+        request_database_service.mark_stale_video_face_jobs_failed(
+            settings.VIDEO_FACE_JOB_STALE_MINUTES
+        )
+        job = request_database_service.get_video_face_search_job(job_id)
+
+        if not job:
+
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": f"Video face search job not found: {job_id}"
+                }
+            )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "job": job
+            }
+        )
+
+    except Exception as e:
+        logger.exception("Video face job lookup failed: job_id=%s", job_id)
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
+        )
+
+    finally:
+        request_database_service.close()
 
 @app.get("/api/v1/osint/jobs/{job_id}")
 async def get_osint_job(
@@ -3339,4 +3643,89 @@ async def register_identity(
 
                 "message": str(e)
             }
+        )
+@app.get("/api/v1/drishti/overview")
+async def get_drishti_overview():
+    """Return DRISHTI acquisition, analytics, graph, and deployment status."""
+
+    try:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "DRISHTI overview loaded",
+                "overview": drishti_service.overview()
+            }
+        )
+    except Exception as exc:
+        logger.exception("DRISHTI overview failed")
+        return JSONResponse(
+            status_code=500,
+            content={"message": "DRISHTI overview failed", "error": str(exc)}
+        )
+
+
+@app.post("/api/v1/drishti/refresh")
+async def refresh_drishti_sources():
+    """Trigger a manual DRISHTI source refresh with resilience status."""
+
+    try:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "DRISHTI sources refreshed",
+                "acquisition": drishti_service.refresh_sources()
+            }
+        )
+    except Exception as exc:
+        logger.exception("DRISHTI refresh failed")
+        return JSONResponse(
+            status_code=500,
+            content={"message": "DRISHTI refresh failed", "error": str(exc)}
+        )
+
+
+@app.post("/api/v1/drishti/search")
+async def search_drishti(payload: dict = Body(default_factory=dict)):
+    """Run advanced Boolean, multilingual, location, and emotion-filtered search."""
+
+    try:
+        result = drishti_service.search(
+            query=str(payload.get("query") or ""),
+            locations=payload.get("locations") or [],
+            emotions=payload.get("emotions") or [],
+            languages=payload.get("languages") or []
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"message": "DRISHTI search completed", "search": result}
+        )
+    except Exception as exc:
+        logger.exception("DRISHTI search failed")
+        return JSONResponse(
+            status_code=500,
+            content={"message": "DRISHTI search failed", "error": str(exc)}
+        )
+
+
+@app.post("/api/v1/drishti/content/generate")
+async def generate_drishti_content(payload: dict = Body(default_factory=dict)):
+    """Generate human-reviewable narrative content from analyst-ready inputs."""
+
+    try:
+        result = drishti_service.generate_content(
+            narrative=payload.get("narrative") or "",
+            content_type=payload.get("content_type") or "Short Post",
+            language=payload.get("language") or "English",
+            tone=payload.get("tone") or "Calm",
+            include_image=bool(payload.get("include_image"))
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"message": "DRISHTI content candidates generated", "generation": result}
+        )
+    except Exception as exc:
+        logger.exception("DRISHTI content generation failed")
+        return JSONResponse(
+            status_code=500,
+            content={"message": "DRISHTI content generation failed", "error": str(exc)}
         )

@@ -301,11 +301,18 @@ to prevent dependency conflicts with PaddleOCR and the Indian ID validator.
 identity-search-service/
 |-- backend/
 |   |-- api/
+|   |   |-- __init__.py
 |   |   `-- routes.py                 # FastAPI endpoints and job orchestration
 |   |-- migrations/                   # PostgreSQL schema migrations and test seeds
 |   |-- services/
-|   |   |-- database_service.py       # Primary SQL and persistence layer
+|   |   |-- database_service.py       # DB connection and repository composer
+|   |   |-- identity_repository.py    # Identity search, admin CRUD, manual review
+|   |   |-- job_repository.py         # Async face/video/document job persistence
+|   |   |-- osint_repository.py       # OSINT jobs and normalized OSINT storage
+|   |   |-- news_repository.py        # News clusters, topics, articles, ingestion
+|   |   |-- database_mixins.py        # Shared async job lifecycle helpers
 |   |   |-- document_verification_service.py
+|   |   |-- video_face_service.py
 |   |   |-- face_service.py
 |   |   |-- file_service.py
 |   |   |-- news_database_service.py
@@ -317,23 +324,17 @@ identity-search-service/
 |   |-- vendor/indian-id-validator/   # Vendored document AI implementation
 |   |-- app.py                        # FastAPI entry point
 |   `-- config.py                     # Environment-backed runtime settings
-|-- face_engine/
-|   |-- app.py                        # Isolated face API
-|   |-- engine.py                     # InsightFace embedding and search logic
-|   `-- requirements-face.txt
-|-- frontend/
-|   `-- dashboard.py                  # Streamlit operator console
-|-- scripts/
-|   `-- backfill_face_embeddings.py
-|-- utils/
-|   `-- logger.py                     # Central console and rotating-file logger
-|-- docs/
-|   |-- assets/                       # README screenshots
-|   `-- *.md                          # Integration and architecture documents
+|-- face_engine/                      # Isolated InsightFace service
+|-- frontend/                         # Streamlit operator console
+|-- scripts/                          # Maintenance and backfill scripts
+|-- utils/                            # Shared utilities
+|-- docs/                             # Architecture and integration docs
 |-- .env.example
 |-- requirements.txt
 `-- README.md
 ```
+
+A more detailed folder map is available in [Project Structure](docs/PROJECT_STRUCTURE.md).
 
 ## Data Model
 
@@ -730,6 +731,7 @@ Invoke-RestMethod http://127.0.0.1:8010/health
 
 ## Additional Documentation
 
+- [Project structure](docs/PROJECT_STRUCTURE.md)
 - [Client and workflow explanation](docs/Identity_Search_Service_Client_Explanation.md)
 - [OSINT webhook integration](docs/OSINT_Webhook_Integration_Setup.md)
 - [News Intelligence webhook integration](docs/News_Intelligence_Webhook_Setup.md)

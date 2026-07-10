@@ -35,6 +35,10 @@ NEWS_SEARCH_URL = "http://127.0.0.1:8000/api/v1/news/search"
 NEWS_TOPICS_URL = "http://127.0.0.1:8000/api/v1/news/topics"
 NEWS_CLUSTER_URL = "http://127.0.0.1:8000/api/v1/news/clusters"
 NEWS_SYNC_STATUS_URL = "http://127.0.0.1:8000/api/v1/news/sync-status/latest"
+DRISHTI_OVERVIEW_URL = "http://127.0.0.1:8000/api/v1/drishti/overview"
+DRISHTI_REFRESH_URL = "http://127.0.0.1:8000/api/v1/drishti/refresh"
+DRISHTI_SEARCH_URL = "http://127.0.0.1:8000/api/v1/drishti/search"
+DRISHTI_CONTENT_URL = "http://127.0.0.1:8000/api/v1/drishti/content/generate"
 
 
 st.set_page_config(
@@ -981,6 +985,111 @@ st.markdown(
             border-color: #a7e3c2;
         }
 
+
+        .drishti-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px;
+            margin: 12px 0 16px 0;
+        }
+
+        .drishti-card {
+            background: #ffffff;
+            border: 1px solid #d9e0ea;
+            border-left: 5px solid #7c3aed;
+            border-radius: 8px;
+            padding: 14px;
+            min-height: 118px;
+            box-shadow: 0 8px 22px rgba(15, 34, 52, 0.05);
+        }
+
+        .drishti-card-title {
+            color: #172033 !important;
+            font-size: 14px;
+            font-weight: 900;
+            line-height: 1.3;
+            margin-bottom: 7px;
+        }
+
+        .drishti-card-meta,
+        .drishti-card-body {
+            color: #46586f !important;
+            font-size: 12px;
+            font-weight: 650;
+            line-height: 1.45;
+            margin-top: 5px;
+        }
+
+        .drishti-chip {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 4px 9px;
+            margin: 3px 5px 3px 0;
+            background: #f4f7fb;
+            border: 1px solid #d9e0ea;
+            color: #334155 !important;
+            font-size: 11px;
+            font-weight: 850;
+        }
+
+        .drishti-chip-good {
+            background: #e7f8ef;
+            border-color: #a7e3c2;
+            color: #087443 !important;
+        }
+
+        .drishti-chip-warn {
+            background: #fff4df;
+            border-color: #ffd891;
+            color: #9a5b00 !important;
+        }
+
+        .drishti-chip-bad {
+            background: #fff0ee;
+            border-color: #ffb8b0;
+            color: #b42318 !important;
+        }
+
+        .drishti-flow {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 10px;
+            margin: 10px 0 16px 0;
+        }
+
+        .drishti-flow-step,
+        .drishti-draft {
+            background: #ffffff;
+            border: 1px solid #d9e0ea;
+            border-radius: 8px;
+            padding: 12px;
+            min-height: 92px;
+        }
+
+        .drishti-draft {
+            border-left: 5px solid #0f5e73;
+            margin: 10px 0;
+        }
+
+        .drishti-flow-label {
+            color: #7c3aed !important;
+            font-size: 11px;
+            font-weight: 900;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+
+        .drishti-map-row {
+            display: grid;
+            grid-template-columns: minmax(140px, 1.2fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(90px, 0.6fr);
+            gap: 8px;
+            align-items: center;
+            background: #ffffff;
+            border: 1px solid #d9e0ea;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin: 8px 0;
+        }
         .status-chip-failed {
             background: var(--danger-soft);
             color: var(--danger);
@@ -1041,6 +1150,11 @@ NAVIGATION_SECTIONS = [
         "label": "News Intelligence",
         "description": "Explore top news, related articles, sources, and entities.",
         "accent": "#be185d"
+    },
+    {
+        "label": "DRISHTI Intelligence",
+        "description": "Design preview for acquisition, search, narratives, graph, heatmaps, GPU readiness, and content operations.",
+        "accent": "#7c3aed"
     }
 ]
 
@@ -1474,6 +1588,377 @@ def render_admin_records_table(records):
     )
 
 
+
+def drishti_chip(label, tone="neutral"):
+    tone_class = {
+        "good": "drishti-chip-good",
+        "warn": "drishti-chip-warn",
+        "bad": "drishti-chip-bad",
+        "neutral": ""
+    }.get(tone, "")
+    return f'<span class="drishti-chip {tone_class}">{html.escape(str(label or "-"))}</span>'
+
+
+def render_drishti_metric_row(metrics):
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Posts", metrics.get("posts_analyzed", 0))
+    metric_cols[1].metric("Alerts", metrics.get("alerts_triggered", 0))
+    metric_cols[2].metric("Negative", metrics.get("negative", 0))
+    metric_cols[3].metric("Neutral", metrics.get("neutral", 0))
+    metric_cols[4].metric("Positive", metrics.get("positive", 0))
+    metric_cols[5].metric("Languages", metrics.get("languages", 0))
+
+
+def render_drishti_cards(title, items, label_key="label", value_key="count"):
+    st.markdown(f'<div class="section-title">{html.escape(title)}</div>', unsafe_allow_html=True)
+    cards = []
+    for item in items[:12]:
+        cards.append(
+            '<div class="drishti-card">'
+            f'<div class="drishti-card-title">{html.escape(str(item.get(label_key) or "-"))}</div>'
+            f'<div class="news-stat-value">{html.escape(str(item.get(value_key) or 0))}</div>'
+            '</div>'
+        )
+    if cards:
+        st.markdown(f'<div class="drishti-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+    else:
+        status_panel("No data available.", "neutral")
+
+
+def render_drishti_distribution(title, mapping):
+    rows = [
+        {"label": key, "count": value}
+        for key, value in sorted((mapping or {}).items(), key=lambda item: str(item[0]))
+    ]
+    render_drishti_cards(title, rows)
+
+
+def render_drishti_implementation_map():
+    st.markdown('<div class="section-title">Client Demo Implementation Map</div>', unsafe_allow_html=True)
+    flow_steps = [
+        ("Acquire", "20-minute refresh, automatic retry, alternate crawler path, source/CAPTCHA flags"),
+        ("Search", "Boolean, phrase, wildcard, multilingual, location and emotion filters"),
+        ("Understand", "Sentiment, emotion, fault line, stance, risk and narrative summarization"),
+        ("Visualize", "Knowledge graph relationships and heatmap-ready geo points"),
+        ("Deploy", "Cloud GPU ready, no OpenAI dependency, Docker/Kubernetes target"),
+        ("Operate", "Review-first content generation to create/change a narrative")
+    ]
+    flow_html = []
+    for index, (label, body) in enumerate(flow_steps, start=1):
+        flow_html.append(
+            '<div class="drishti-flow-step">'
+            f'<div class="drishti-flow-label">Step {index}</div>'
+            f'<div class="drishti-card-title">{html.escape(label)}</div>'
+            f'<div class="drishti-card-body">{html.escape(body)}</div>'
+            '</div>'
+        )
+    st.markdown(f'<div class="drishti-flow">{"".join(flow_html)}</div>', unsafe_allow_html=True)
+
+
+def render_drishti_source_cards(acquisition):
+    cards = []
+    for source in acquisition.get("sources") or []:
+        status = str(source.get("status") or "unknown")
+        tone = "good" if status == "available" else "bad" if "captcha" in status or "unavailable" in status else "warn"
+        accent = "#087443" if tone == "good" else "#b42318" if tone == "bad" else "#9a5b00"
+        cards.append(
+            f'<div class="drishti-card" style="border-left-color: {accent};">'
+            f'<div class="drishti-card-title">{html.escape(str(source.get("name") or "Source"))}</div>'
+            f'{drishti_chip(status.replace("_", " ").title(), tone)}'
+            f'{drishti_chip(str(source.get("type") or "source").replace("_", " ").title())}'
+            f'<div class="drishti-card-meta">Attempts: {html.escape(str(source.get("attempts") or 0))}</div>'
+            f'<div class="drishti-card-body">Alternate path: {html.escape(str(source.get("alternate") or "-"))}</div>'
+            f'<div class="drishti-card-body">{html.escape(str(source.get("last_error") or "No active source error."))}</div>'
+            '</div>'
+        )
+    st.markdown(f'<div class="drishti-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def render_drishti_narratives(narratives):
+    cards = []
+    for card in (narratives or [])[:12]:
+        risk = float(card.get("risk_score") or 0)
+        tone = "bad" if risk >= 0.7 else "warn" if risk >= 0.5 else "good"
+        accent = "#b42318" if tone == "bad" else "#9a5b00" if tone == "warn" else "#087443"
+        sub_html = "".join(drishti_chip(item) for item in card.get("sub_narratives", [])[:4])
+        cards.append(
+            f'<div class="drishti-card" style="border-left-color: {accent};">'
+            f'<div class="drishti-card-title">{html.escape(str(card.get("narrative") or "Narrative"))}</div>'
+            f'{drishti_chip("Risk " + str(card.get("risk_score", 0)), tone)}'
+            f'{drishti_chip("Confidence " + str(card.get("confidence", 0)))}'
+            f'{drishti_chip(str(card.get("stance") or "Neutral"))}'
+            f'<div class="drishti-card-meta">Fault line: {html.escape(str(card.get("fault_line") or "-"))}</div>'
+            f'<div class="drishti-card-body">{html.escape(str(card.get("summary") or "No summary available."))}</div>'
+            f'<div class="drishti-card-body">Prediction: {html.escape(str(card.get("risk_prediction") or "-"))}</div>'
+            f'<div class="drishti-card-body">{sub_html}</div>'
+            '</div>'
+        )
+    if cards:
+        st.markdown(f'<div class="drishti-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+    else:
+        status_panel("No narrative intelligence is available yet.", "neutral")
+
+
+def render_drishti_search_results(search_payload):
+    results = search_payload.get("results") or []
+    cards = []
+    for row in results[:12]:
+        risk = float(row.get("risk_score") or 0)
+        tone = "bad" if risk >= 0.7 else "warn" if risk >= 0.5 else "good"
+        accent = "#b42318" if tone == "bad" else "#9a5b00" if tone == "warn" else "#087443"
+        cards.append(
+            f'<div class="drishti-card" style="border-left-color: {accent};">'
+            f'<div class="drishti-card-title">{html.escape(str(row.get("narrative") or row.get("id") or "Result"))}</div>'
+            f'{drishti_chip(str(row.get("source") or "Source"))}'
+            f'{drishti_chip(str(row.get("location") or "Location"))}'
+            f'{drishti_chip(str(row.get("emotion") or "Emotion"))}'
+            f'{drishti_chip(str(row.get("sentiment") or "Sentiment"))}'
+            f'{drishti_chip("Risk " + str(row.get("risk_score") or 0), tone)}'
+            f'<div class="drishti-card-body">{html.escape(str(row.get("translated_text") or row.get("text") or ""))[:520]}</div>'
+            '</div>'
+        )
+    if cards:
+        st.markdown(f'<div class="drishti-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+    else:
+        status_panel("No DRISHTI records matched this search.", "warning")
+
+
+def render_drishti_heatmap_points(points):
+    rows = []
+    for point in (points or [])[:12]:
+        risk = float(point.get("risk_score") or 0)
+        tone = "bad" if risk >= 0.7 else "warn" if risk >= 0.5 else "good"
+        rows.append(
+            '<div class="drishti-map-row">'
+            f'<div><strong>{html.escape(str(point.get("location") or "-"))}</strong></div>'
+            f'<div>{html.escape(str(point.get("sentiment") or "Neutral"))}</div>'
+            f'<div>{drishti_chip("Risk " + str(point.get("risk_score") or 0), tone)}</div>'
+            f'<div>{html.escape(str(point.get("lat") or "-"))}, {html.escape(str(point.get("lon") or "-"))}</div>'
+            '</div>'
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True) if rows else status_panel("No heatmap points available.", "neutral")
+
+
+def render_drishti_graph_edges(graph):
+    cards = []
+    for edge in ((graph or {}).get("edges") or [])[:12]:
+        cards.append(
+            '<div class="drishti-card">'
+            f'<div class="drishti-card-title">{html.escape(str(edge.get("source") or "-"))}</div>'
+            f'{drishti_chip(str(edge.get("relation") or "related"))}'
+            f'<div class="drishti-card-body">Target: {html.escape(str(edge.get("target") or "-"))}</div>'
+            '</div>'
+        )
+    st.markdown(f'<div class="drishti-grid">{"".join(cards)}</div>', unsafe_allow_html=True) if cards else status_panel("No graph edges available.", "neutral")
+
+
+def render_drishti_deployment_cards(deployment):
+    deployment = deployment or {}
+    rows = [
+        ("Cloud GPU Ready", "Ready" if deployment.get("cloud_gpu_ready") else "Pending", "good" if deployment.get("cloud_gpu_ready") else "warn"),
+        ("OpenAI Dependency", "No" if not deployment.get("openai_dependency") else "Yes", "good" if not deployment.get("openai_dependency") else "warn"),
+        ("Model Runtime", deployment.get("model_runtime") or "Pluggable local/GPU LLM endpoint", "neutral"),
+        ("Deployment Target", deployment.get("container_target") or "Docker/Kubernetes", "neutral")
+    ]
+    cards = []
+    for title, value, tone in rows:
+        cards.append(
+            '<div class="drishti-card">'
+            f'<div class="drishti-card-title">{html.escape(str(title))}</div>'
+            f'{drishti_chip(value, tone)}'
+            '</div>'
+        )
+    st.markdown(f'<div class="drishti-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+
+def render_drishti_platform_fetch_table(acquisition):
+    """Render platform-level fetch status, retry, alternate crawler, and CAPTCHA flags."""
+
+    rows = []
+    for source in acquisition.get("sources") or []:
+        status = str(source.get("status") or "unknown")
+        last_error = str(source.get("last_error") or "")
+        if "captcha" in status.lower() or "captcha" in last_error.lower():
+            resolution = "Data cannot be fetched/resolved because CAPTCHA is unresolved. Route to manual review or alternate provider."
+        elif status == "available":
+            resolution = "Data fetch available through configured source path."
+        elif "unavailable" in status.lower():
+            resolution = "Source unavailable. Use alternate crawler/provider and retry on next refresh."
+        else:
+            resolution = "Retry automatically and use alternate crawler path if source remains blocked."
+        rows.append({
+            "platform": source.get("name") or "-",
+            "source_type": str(source.get("type") or "-").replace("_", " ").title(),
+            "fetch_status": status.replace("_", " ").title(),
+            "attempts": source.get("attempts") or 0,
+            "alternate": source.get("alternate") or "-",
+            "issue": last_error or "-",
+            "resolution": resolution
+        })
+
+    render_light_table(
+        rows,
+        [
+            ("Platform", "platform"),
+            ("Type", "source_type"),
+            ("Fetch Status", "fetch_status"),
+            ("Attempts", "attempts"),
+            ("Alternate Crawler / Provider", "alternate"),
+            ("Issue", "issue"),
+            ("Resolution", "resolution")
+        ],
+        "No platform fetch status records available."
+    )
+
+
+def render_drishti_osint_job_loader():
+    """Expose the existing OSINT job lookup workflow inside DRISHTI."""
+
+    st.markdown('<div class="section-title">OSINT Job Load</div>', unsafe_allow_html=True)
+    status_panel("Load an existing OSINT job here to demonstrate how DRISHTI can reuse identity-search OSINT evidence.", "neutral")
+    render_osint_job_lookup_panel()
+    loaded_job = st.session_state.get("last_osint_job")
+    if loaded_job:
+        st.markdown('<div class="section-title">Loaded OSINT Job Evidence</div>', unsafe_allow_html=True)
+        render_osint_job_card(loaded_job)
+def render_drishti_workspace():
+    response, result = get_request(DRISHTI_OVERVIEW_URL)
+    if response is None or response.status_code != 200:
+        status_panel(result.get("message", "DRISHTI overview could not be loaded."), "danger")
+        return
+
+    overview = result.get("overview") or {}
+    acquisition = overview.get("acquisition") or {}
+
+    refresh_col, status_col = st.columns([0.8, 2.2])
+    with refresh_col:
+        if st.button("Refresh Sources", type="primary", use_container_width=True, key="drishti_refresh_sources"):
+            refresh_response, refresh_result = post_request(DRISHTI_REFRESH_URL, json_body={})
+            if refresh_response is None or refresh_response.status_code != 200:
+                status_panel(refresh_result.get("message", "Source refresh failed."), "danger")
+            else:
+                status_panel("DRISHTI acquisition refresh completed.", "success")
+                st.rerun()
+    with status_col:
+        st.caption(
+            f"Refresh every {acquisition.get('refresh_interval_minutes', 20)} minutes. "
+            f"Available sources: {acquisition.get('available_sources', 0)}/{acquisition.get('total_sources', 0)}. "
+            f"Active data source: {str(overview.get('data_source') or 'default_demo_data').replace('_', ' ').title()}."
+        )
+
+
+    map_tab, acquisition_tab, search_tab, narrative_tab, visual_tab, infrastructure_tab, content_tab = st.tabs([
+        "Implementation Map",
+        "Acquisition",
+        "Search",
+        "Narratives",
+        "Visual Analytics",
+        "Infrastructure",
+        "Content Operations"
+    ])
+
+    with map_tab:
+        render_drishti_implementation_map()
+        st.markdown('<div class="section-title">Platform Fetch Resolution</div>', unsafe_allow_html=True)
+        render_drishti_platform_fetch_table(acquisition)
+
+    with acquisition_tab:
+        st.markdown('<div class="section-title">Data Acquisition & Resilience</div>', unsafe_allow_html=True)
+        status_cols = st.columns(4)
+        status_cols[0].metric("Refresh Window", f"{acquisition.get('refresh_interval_minutes', 20)} min")
+        status_cols[1].metric("Available Sources", f"{acquisition.get('available_sources', 0)}/{acquisition.get('total_sources', 0)}")
+        status_cols[2].metric("Flagged Sources", len(acquisition.get("unavailable_sources") or []))
+        status_cols[3].metric("Next Refresh", str(acquisition.get("next_refresh") or "-")[:16])
+        render_drishti_source_cards(acquisition)
+        st.markdown('<div class="section-title">Platform Fetch Resolution</div>', unsafe_allow_html=True)
+        render_drishti_platform_fetch_table(acquisition)
+        render_drishti_osint_job_loader()
+
+    with search_tab:
+        query_col, location_col, emotion_col, language_col = st.columns([2, 1, 1, 1])
+        with query_col:
+            query = st.text_input("Boolean query", value='"public trust" OR rumour* AND -spam', key="drishti_query")
+        with location_col:
+            location_options = sorted({point.get("location") for point in overview.get("heatmap", []) if point.get("location")}) or ["Chennai", "Delhi", "Guwahati", "Jaipur", "Pune", "Srinagar"]
+            locations = st.multiselect("Location tags", location_options, key="drishti_locations")
+        with emotion_col:
+            emotions = st.multiselect("Emotion filter", ["Anger", "Fear", "Neutral", "Trust"], key="drishti_emotions")
+        with language_col:
+            languages = st.multiselect("Languages", ["en", "hi"], key="drishti_languages")
+        if st.button("Search DRISHTI", type="primary", use_container_width=True, key="drishti_search_button"):
+            search_response, search_result = post_request(DRISHTI_SEARCH_URL, json_body={"query": query, "locations": locations, "emotions": emotions, "languages": languages})
+            if search_response is None or search_response.status_code != 200:
+                status_panel(search_result.get("message", "DRISHTI search failed."), "danger")
+            else:
+                st.session_state["drishti_search"] = search_result.get("search") or {}
+                status_panel("DRISHTI search completed.", "success")
+        search_payload = st.session_state.get("drishti_search") or {}
+        if search_payload:
+            result_cols = st.columns(3)
+            result_cols[0].metric("Matches", search_payload.get("total", 0))
+            result_cols[1].metric("Keywords", len(search_payload.get("keyword_recommendations") or []))
+            result_cols[2].metric("Data Source", str(search_payload.get("data_source") or "-").replace("_", " ").title())
+            render_drishti_search_results(search_payload)
+            render_drishti_distribution("Automatic Keyword Recommendations", {item.get("keyword"): item.get("score") for item in search_payload.get("keyword_recommendations", [])})
+
+    with narrative_tab:
+        st.markdown('<div class="section-title">Narrative & Sentiment Intelligence</div>', unsafe_allow_html=True)
+        render_drishti_narratives(overview.get("narratives") or [])
+
+    with visual_tab:
+        st.markdown('<div class="section-title">Visualization & Analytics</div>', unsafe_allow_html=True)
+        left_col, right_col = st.columns(2)
+        with left_col:
+            render_drishti_distribution("Source Breakdown", overview.get("source_breakdown") or {})
+            render_drishti_distribution("Sentiment Distribution", overview.get("sentiment_distribution") or {})
+        with right_col:
+            render_drishti_distribution("Location Tags", overview.get("location_breakdown") or {})
+            st.markdown('<div class="section-title">Heat Map Points</div>', unsafe_allow_html=True)
+            render_drishti_heatmap_points(overview.get("heatmap") or [])
+        st.markdown('<div class="section-title">Knowledge Graph</div>', unsafe_allow_html=True)
+        render_drishti_graph_edges(overview.get("knowledge_graph") or {})
+
+    with infrastructure_tab:
+        st.markdown('<div class="section-title">Infrastructure Readiness</div>', unsafe_allow_html=True)
+        render_drishti_deployment_cards(overview.get("deployment") or {})
+        status_panel("Designed for cloud-hosted GPU deployment with pluggable local models and no OpenAI dependency.", "success")
+
+    with content_tab:
+        st.markdown('<div class="section-title">Content Operations</div>', unsafe_allow_html=True)
+        narrative_options = [card.get("narrative") for card in overview.get("narratives", []) if card.get("narrative")]
+        selected_narrative = st.selectbox("Narrative", narrative_options or ["Public trust"], key="drishti_content_narrative")
+        content_col, language_col, tone_col, image_col = st.columns([1, 1, 1, 0.8])
+        with content_col:
+            content_type = st.selectbox("Format", ["Short Post", "Blog", "Article", "Response Comment"], key="drishti_content_type")
+        with language_col:
+            language = st.selectbox("Language", ["English", "Hindi", "Bilingual"], key="drishti_content_language")
+        with tone_col:
+            tone = st.selectbox("Tone", ["Calm", "Corrective", "Empathetic", "Urgent"], key="drishti_content_tone")
+        with image_col:
+            include_image = st.checkbox("Image prompt", key="drishti_include_image")
+        if st.button("Generate Content Candidates", type="primary", use_container_width=True, key="drishti_generate_content"):
+            generation_response, generation_result = post_request(DRISHTI_CONTENT_URL, json_body={"narrative": selected_narrative, "content_type": content_type, "language": language, "tone": tone, "include_image": include_image})
+            if generation_response is None or generation_response.status_code != 200:
+                status_panel(generation_result.get("message", "Content generation failed."), "danger")
+            else:
+                st.session_state["drishti_generation"] = generation_result.get("generation") or {}
+                status_panel("Content candidates generated for human review.", "success")
+        generation = st.session_state.get("drishti_generation") or {}
+        if generation:
+            status_panel("Human-in-the-loop review is required before campaign use.", "warning")
+            draft_cards = []
+            for output in generation.get("outputs", []):
+                draft_cards.append(
+                    '<div class="drishti-draft">'
+                    f'<div class="drishti-card-title">{html.escape(str(output.get("model") or "Candidate"))}</div>'
+                    f'{drishti_chip("Confidence " + str(output.get("confidence") or 0), "good")}'
+                    f'<div class="drishti-card-body">{html.escape(str(output.get("content") or ""))}</div>'
+                    '</div>'
+                )
+            st.markdown("".join(draft_cards), unsafe_allow_html=True)
+            if generation.get("image_prompt"):
+                st.text_area("Image prompt", generation.get("image_prompt"), height=90, key="drishti_image_prompt_output")
 def render_header():
     """Render the dashboard title and summary header."""
 
@@ -3966,6 +4451,10 @@ render_header()
 
 selected_dashboard_section = render_sidebar_navigation()
 render_active_section_header(selected_dashboard_section)
+
+
+if selected_dashboard_section == "DRISHTI Intelligence":
+    render_drishti_workspace()
 
 
 if selected_dashboard_section == "Identity Search":

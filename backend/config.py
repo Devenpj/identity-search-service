@@ -155,6 +155,30 @@ class Settings:
             "30"
         )
     )
+    VIDEO_FACE_SAMPLE_SECONDS = float(
+        os.environ.get(
+            "VIDEO_FACE_SAMPLE_SECONDS",
+            "1.0"
+        )
+    )
+    VIDEO_FACE_MAX_SAMPLED_FRAMES = int(
+        os.environ.get(
+            "VIDEO_FACE_MAX_SAMPLED_FRAMES",
+            "600"
+        )
+    )
+    VIDEO_FACE_DEDUP_THRESHOLD = float(
+        os.environ.get(
+            "VIDEO_FACE_DEDUP_THRESHOLD",
+            "0.55"
+        )
+    )
+    VIDEO_FACE_JOB_STALE_MINUTES = int(
+        os.environ.get(
+            "VIDEO_FACE_JOB_STALE_MINUTES",
+            "45"
+        )
+    )
     DOCUMENT_VALIDATION_JOB_STALE_MINUTES = int(
         os.environ.get(
             "DOCUMENT_VALIDATION_JOB_STALE_MINUTES",

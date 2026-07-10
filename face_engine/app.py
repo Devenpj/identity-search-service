@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from engine import detect_faces_payload
 from engine import embedding_payload
 from engine import load_face_app
 from engine import search_candidates
@@ -17,6 +18,13 @@ app = FastAPI(
 )
 
 
+
+class DetectFacesRequest(BaseModel):
+    """Request for detecting and saving every face from one sampled frame."""
+
+    image_path: str
+    output_dir: str
+    output_prefix: str
 class EmbeddingRequest(BaseModel):
     """Request for extracting one normalized face embedding."""
 
@@ -57,6 +65,29 @@ def health():
         "engine": "insightface"
     }
 
+
+
+@app.post("/detect-faces")
+def detect_faces(request: DetectFacesRequest):
+    """Detect every face in one frame and save dashboard-ready face crops."""
+
+    try:
+
+        return {
+            "status": "success",
+            "faces": detect_faces_payload(
+                request.image_path,
+                request.output_dir,
+                request.output_prefix
+            )
+        }
+
+    except Exception as error:
+
+        return {
+            "status": "error",
+            "message": str(error)
+        }
 
 @app.post("/embedding")
 def embedding(request: EmbeddingRequest):

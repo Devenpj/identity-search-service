@@ -9,3 +9,12 @@ try:
     from backend.api.routes import app
 except ModuleNotFoundError:
     from api.routes import app
+
+
+"""Because your startup flow is:
+cd backend
+uvicorn app:app --reload
+That command specifically looks for:
+backend/app.py
+app
+"""
