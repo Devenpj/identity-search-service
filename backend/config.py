@@ -172,6 +172,7 @@ class Settings:
             "VIDEO_FACE_DEDUP_THRESHOLD",
             "0.55"
         )
+        
     )
     VIDEO_FACE_JOB_STALE_MINUTES = int(
         os.environ.get(

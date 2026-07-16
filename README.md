@@ -462,6 +462,29 @@ Run this after initially loading identities or after bulk photo changes.
 
 ## Running the System
 
+### React Dashboard
+
+The project now includes a modern React/Vite dashboard in `web/`. It can run beside the existing Streamlit dashboard while you migrate workflows.
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:5173
+```
+
+By default the React app calls FastAPI at `http://127.0.0.1:8000`. To point it somewhere else, create `web/.env` with:
+
+```env
+VITE_API_BASE_URL=http://YOUR_BACKEND_HOST:8000
+```
+
+
 Use three visible terminals.
 
 ### Terminal 1: InsightFace engine

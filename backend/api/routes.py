@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+from pathlib import Path
 from datetime import datetime
 from uuid import uuid4
 
@@ -27,6 +28,8 @@ from fastapi import File
 from fastapi import Query
 from fastapi import Body
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 try:
     from ..config import settings
@@ -64,6 +67,33 @@ configure_logging()
 logger = get_logger("identity-search-service.backend")
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+for mount_path, directory in {
+    "/media/backend-uploads": PROJECT_ROOT / "backend" / "uploads",
+    "/media/uploads": PROJECT_ROOT / "uploads",
+    "/media/matched-photos": PROJECT_ROOT / "frontend" / "matched_employee_photos"
+}.items():
+    if directory.exists():
+        app.mount(
+            mount_path,
+            StaticFiles(directory=str(directory)),
+            name=mount_path.replace("/", "_")
+        )
 
 database_service = DatabaseService()
 decision_service = DecisionService()
@@ -1009,22 +1039,36 @@ def health_full(
     osint_payload, osint_status_code = osint_health_payload(
         check_network=check_osint_network
     )
-    status_code = 200
+    core_unhealthy = db_status_code >= 400
+    optional_unhealthy = osint_status_code >= 400 or news_db_status_code >= 400
+    status_code = 503 if core_unhealthy else 200
 
-    if db_status_code >= 400 or osint_status_code >= 400 or news_db_status_code >= 400:
-        status_code = 503
+    if core_unhealthy:
+        overall_status = "error"
+    elif optional_unhealthy:
+        overall_status = "degraded"
+    else:
+        overall_status = "ok"
 
     return JSONResponse(
         status_code=status_code,
         content={
-            "status": "ok" if status_code == 200 else "error",
+            "status": overall_status,
             "service": "identity-search-service",
             "api": {
                 "status": "ok"
             },
             "database": db_payload,
             "news_database": news_db_payload,
-            "osint": osint_payload
+            "osint": osint_payload,
+            "degraded": optional_unhealthy and not core_unhealthy,
+            "message": (
+                "Core API and identity database are healthy; one or more optional integrations are unavailable."
+                if optional_unhealthy and not core_unhealthy
+                else "All checked services are healthy."
+                if not core_unhealthy
+                else "Core database health check failed."
+            )
         }
     )
 
@@ -1220,6 +1264,7 @@ async def search_identity_advanced(
 
                 "status": "error",
 
+              
                 "message": str(e)
             }
         )
@@ -1227,8 +1272,8 @@ async def search_identity_advanced(
 
 @app.post("/api/v1/osint/jobs")
 async def submit_approved_osint_job(
-
-    background_tasks: BackgroundTasks,
+   background_tasks: BackgroundTasks,
+  
 
     targets_json: str = Form(...),
 
@@ -1492,6 +1537,7 @@ async def submit_video_face_verification(
 
     finally:
         request_database_service.close()
+
 
 @app.get("/api/v1/jobs/video-face-search/{job_id}")
 async def get_video_face_search_job(

@@ -85,7 +85,15 @@ OCR/vendor model stack.
 
 ```text
 frontend/
-`-- dashboard.py             Streamlit dashboard for all operator workflows
+`-- dashboard.py             Legacy Streamlit dashboard for all operator workflows
+
+web/
+|-- package.json             React/Vite scripts and dependencies
+|-- index.html               Browser entrypoint
+`-- src/
+    |-- App.jsx              React workflow screens
+    |-- api.js               FastAPI client helpers
+    `-- styles.css           Modern dashboard theme
 ```
 
 Runtime matched photos and generated previews are ignored by Git.

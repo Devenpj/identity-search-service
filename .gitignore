@@ -32,3 +32,6 @@ dist/
 .DS_Store
 Thumbs.db
 backend/vendor/indian-id-validator/models/*.onnx
+web/node_modules/
+web/dist/
+web/.vite/
